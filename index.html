@@ -683,7 +683,7 @@ const vnNames={K:'Tướng',A:'Sĩ',B:'Tượng',N:'Mã',R:'Xe',C:'Pháo',P:'Bin
 const toastEl=document.getElementById('toast');
 
 let redTotalTime = 15 * 60, blackTotalTime = 15 * 60;
-let redMoveTime = 40, blackMoveTime = 40;
+let redMoveTime = 60, blackMoveTime = 60;
 let clockInterval = null;
 let checkBannerTimer = null;
 
@@ -710,7 +710,7 @@ function startClockTimer() {
 }
 
 function resetMoveTimer() {
-  if (redTurn) redMoveTime = 40; else blackMoveTime = 40;
+  if (redTurn) redMoveTime = 60; else blackMoveTime = 60;
 }
 
 function triggerTimeOut(isRedTimeout) {
@@ -1711,7 +1711,7 @@ function newGame(){
  positionHistory = [getBoardString(board, true)];
  aiVsAiPaused = false;
  redTotalTime = 15 * 60; blackTotalTime = 15 * 60;
- redMoveTime = 40; blackMoveTime = 40;
+ redMoveTime = 60; blackMoveTime = 60;
  updatePlayerRoles(); updateClockDisplay(); startClockTimer();
  document.getElementById('gameMessage').textContent=gameMode==='aiai'?'AI đang tự động đấu...':'Chọn quân Đỏ để bắt đầu.';
  document.getElementById('evalText').textContent='Cân bằng'; document.getElementById('evalRed').style.width='50%';
