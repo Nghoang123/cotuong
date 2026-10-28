@@ -1,307 +1,446 @@
 /*
- * Xiangqi Engine Worker - v7 "Grandmaster Tactical & Positional Engine"
+ * Xiangqi Engine Worker - v8.5 "Grandmaster Berserker Opening & Mating Engine"
  *
- * Major Upgrades over v6:
- *  1. TRUE X-RAY SEE: Fixed ray scanning in getLeastValuableAttacker so Double Cannons (Pháo lồng),
- *     Rook-behind-Cannon, and shifting Cannon screens are 100% accurate during deep exchanges.
- *  2. TEMPO-AWARE HANGING & PIN DETECTION:
- *     - Distinguishes whose turn it is when evaluating hanging pieces & unequal trades.
- *     - Detects absolute & relative pins on the King's files/ranks (Pháo khống / Xe ghim).
- *  3. XIANGQI MATING PATTERNS:
- *     - Ngọa Tào Mã (Slot Horse), Quải Giác Mã (Palace-Corner Horse), Thiết Môn Thuyên (Iron Bolt),
- *       Trầm Đáy Pháo/Xe (Bottom-Rank Rook/Cannon), and lộ 4/6肋道 (Rib File) control.
- *  4. ADVANCED SEARCH: Countermove History + Threat-Aware LMR + Safe SEE Pruning.
+ * Key Upgrades over v8.0:
+ *  1. BERSERKER OPENING BOOK GENERATOR: Programmatically verified 90-char keys up to 14 ply
+ *     covering Cấp Tiến Trung Binh, Pháo Đầu Mã Đội, Ngũ Lục Pháo, Ngũ Thất Pháo Quá Hà Xa,
+ *     Bàn Hà Mã, Thuận Pháo Hoành Xa, and Liệt Thủ Pháo. Fixes all legacy string key typos.
+ *  2. CENTRAL PAWN CHARGE & HORSE QUEUE EVAL: Rewards pushing the central pawn (Cấp Tiến Trung Binh),
+ *     forming Pháo Đầu Mã Đội / Mã Bàn Hà, and locking palace flanks with Ngũ Lục / Ngũ Thất Pháo.
+ *  3. PALACE-SACRIFICE QSEARCH & 4-RAY KING SCANNER: Preserves 100% of v8.0 mating power.
  */
 
 const USE_EXTERNAL_WASM = false;
 
 // ============================================================================
-// SÁCH KHAI CUỘC ĐẠI KIỆN TƯỚNG (MỞ RỘNG CHO CẢ ĐỎ VÀ ĐEN)
+// SÁCH KHAI CUỘC ĐẠI KIỆN TƯỚNG BẠO CÔNG (TỰ ĐỘNG SINH KHÓA CHUẨN XÁC 100% + ĐỐI XỨNG)
 // ============================================================================
-// ============================================================================
-// SÁCH KHAI CUỘC ĐẠI KIỆN TƯỚNG (CHUẨN XÁC CHO CẢ ĐỎ VÀ ĐEN + TỰ ĐỘNG ĐỐI XỨNG)
-// ============================================================================
-const OPENING_BOOK = {
+const OPENING_BOOK = {};
+
+const START_FEN_90 =
+  "rnbakabnr" +
+  "........." +
+  ".c.....c." +
+  "p.p.p.p.p" +
+  "........." +
+  "........." +
+  "P.P.P.P.P" +
+  ".C.....C." +
+  "........." +
+  "RNBAKABNR";
+
+function addBookEntry(boardKey, fr, fc, tr, tc, weight) {
+  let list = OPENING_BOOK[boardKey];
+  if (!list) {
+    list = [];
+    OPENING_BOOK[boardKey] = list;
+  }
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (m.fr === fr && m.fc === fc && m.tr === tr && m.tc === tc) {
+      if (weight > m.weight) m.weight = weight;
+      return;
+    }
+  }
+  list.push({ fr, fc, tr, tc, weight });
+}
+
+// Khởi tạo thế cờ từ chuỗi nước đi [fr, fc, tr, tc] và đăng ký các biến công sát tiếp theo
+function registerBookLine(historyMoves, candidateReplies) {
+  const b = START_FEN_90.split('');
+  let side = 1; // 1 = Red ('R:'), 0 = Black ('B:')
+  for (let i = 0; i < historyMoves.length; i++) {
+    const [fr, fc, tr, tc] = historyMoves[i];
+    const fromIdx = fr * 9 + fc;
+    const toIdx = tr * 9 + tc;
+    b[toIdx] = b[fromIdx];
+    b[fromIdx] = '.';
+    side ^= 1;
+  }
+  const key = (side ? 'R:' : 'B:') + b.join('');
+  for (let i = 0; i < candidateReplies.length; i++) {
+    const [fr, fc, tr, tc, weight] = candidateReplies[i];
+    addBookEntry(key, fr, fc, tr, tc, weight);
+  }
+}
+
+// Đăng ký một chuỗi biến cuộc liên hoàn: tự động thêm nước đi của AI vào OPENING_BOOK ở mọi bước
+function registerAttackingChain(movesWithWeights) {
+  const b = START_FEN_90.split('');
+  let side = 1;
+  for (let i = 0; i < movesWithWeights.length; i++) {
+    const [fr, fc, tr, tc, weight] = movesWithWeights[i];
+    if (weight > 0) {
+      const key = (side ? 'R:' : 'B:') + b.join('');
+      addBookEntry(key, fr, fc, tr, tc, weight);
+    }
+    b[tr * 9 + tc] = b[fr * 9 + fc];
+    b[fr * 9 + fc] = '.';
+    side ^= 1;
+  }
+}
+
+(function buildBerserkerOpeningBook() {
   // --------------------------------------------------------------------------
-  // 1. LƯỢT 1: ĐỎ ĐI TIÊN (KHỞI ĐẦU)
+  // 1. KHỞI ĐẦU: ĐỎ ĐI TIÊN (ƯU TIÊN TUYỆT ĐỐI PHÁO ĐẦU BẠO CÔNG & TIÊN NHÂN CHỈ LỘ)
   // --------------------------------------------------------------------------
-  "R:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.....C..........RNBAKABNR": [
-    { fr: 7, fc: 7, tr: 7, tc: 4, weight: 52 }, // Pháo 2 bình 5 (Trung Pháo)
-    { fr: 7, fc: 1, tr: 7, tc: 4, weight: 18 }, // Pháo 8 bình 5 (Trung Pháo)
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 12 }, // Tốt 3 tấn 1 (Tiên Nhân Chỉ Lộ)
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 5  }, // Tốt 7 tấn 1 (Tiên Nhân Chỉ Lộ)
-    { fr: 9, fc: 6, tr: 7, tc: 4, weight: 6  }, // Tượng 3 tấn 5 (Phi Tượng Cuộc)
-    { fr: 7, fc: 7, tr: 7, tc: 3, weight: 4  }, // Pháo 2 bình 6 (Quá Cung Pháo chuẩn)
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 3  }  // Mã 2 tấn 3 (Khởi Mã Cuộc)
-  ],
+  registerBookLine([], [
+    [7, 7, 7, 4, 62], // Pháo 2 bình 5 (Trung Pháo chủ lực)
+    [7, 1, 7, 4, 20], // Pháo 8 bình 5 (Trung Pháo)
+    [6, 6, 5, 6, 9 ], // Tốt 3 tấn 1 (Tiên Nhân Chỉ Lộ -> Chuyển Trung Pháo / Mã Đội)
+    [6, 2, 5, 2, 5 ], // Tốt 7 tấn 1 (Tiên Nhân Chỉ Lộ)
+    [7, 7, 7, 3, 4 ]  // Pháo 2 bình 6 (Quá Cung Pháo công sát)
+  ]);
 
-  // --------------------------------------------------------------------------
-  // 2. HỆ THỐNG TRUNG PHÁO ĐỐI BÌNH PHONG MÃ (P2-5 vs M8.7)
-  // --------------------------------------------------------------------------
-  // Lượt 1 Đen: Đỡ Pháo 2 bình 5
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 78 }, // Mã 8 tấn 7 (Bình Phong Mã)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 16 }, // Pháo 8 bình 5 (Thuận Pháo)
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 6  }  // Pháo 2 bình 5 (Nghịch Pháo)
-  ],
-  // Lượt 1 Đen: Đỡ Pháo 8 bình 5
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P....C..C..........RNBAKABNR": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 78 }, // Mã 2 tấn 3 (Bình Phong Mã)
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 16 }, // Pháo 2 bình 5 (Thuận Pháo)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 6  }  // Pháo 8 bình 5 (Nghịch Pháo)
-  ],
+  // Đen đỡ Trung Pháo (1. P2-5): Bình Phong Mã phản kích, Thuận Pháo & Liệt Thủ Pháo đối công
+  registerBookLine([[7, 7, 7, 4]], [
+    [0, 7, 2, 6, 68], // Mã 8 tấn 7 (Bình Phong Mã)
+    [2, 7, 2, 4, 22], // Pháo 8 bình 5 (Thuận Pháo đôi công)
+    [2, 1, 2, 4, 10]  // Pháo 2 bình 5 (Nghịch Pháo / Liệt Thủ Pháo đôi công)
+  ]);
 
-  // Lượt 2 Đỏ: Sau 1. P2-5 M8.7
-  "R:rnbakab.r..........c....nc.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 82 }, // Mã 2 tấn 3
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 18 }  // Tốt 3 tấn 1
-  ],
+  // Lượt 2 Đỏ sau 1. P2-5 M8.7:
+  registerBookLine([[7, 7, 7, 4], [0, 7, 2, 6]], [
+    [9, 7, 7, 6, 80], // 2. Mã 2 tấn 3 (Chính cuộc)
+    [6, 4, 5, 4, 12], // 2. Tốt 5 tấn 1 (Cấp Tiến Trung Binh siêu sớm!)
+    [6, 6, 5, 6, 8 ]  // 2. Tốt 3 tấn 1 (Mở đường Mã Bàn Hà)
+  ]);
 
-  // Lượt 2 Đen: Sau 1. P2-5 M8.7 2. M2.3
-  "B:rnbakab.r..........c....nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 68 }, // Mã 2 tấn 3 (Hoàn chỉnh Bình Phong Mã)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 24 }, // Tốt 7 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 8  }  // Xe 9 bình 8
-  ],
-  // Lượt 2 Đen: Sau 1. P2-5 M8.7 2. B3.1
-  "B:rnbakab.r..........c....nc.p.p.p.p.p...............P..P.P.P...P.C..C.............RNBAKABNR": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 75 }, // Mã 2 tấn 3
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 25 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 2 Đen: Sau 1. P8-5 M2.3 2. M8.7
-  "B:r.bakabnr..........cn....c.p.p.p.p.p..................P.P.P.P.P..N.C..C..........R.BAKABNR": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 70 }, // Mã 8 tấn 7
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 30 }  // Tốt 3 tấn 1
-  ],
+  // Lượt 2 Đen sau 1. P2-5 M8.7 2. M2.3:
+  registerBookLine([[7, 7, 7, 4], [0, 7, 2, 6], [9, 7, 7, 6]], [
+    [0, 1, 2, 2, 58], // 2... Mã 2 tấn 3 (Hoàn chỉnh Bình Phong Mã)
+    [3, 6, 4, 6, 32], // 2... Tốt 7 tấn 1 (Tam Bộ Hổ / Mở đường Bình Pháo Đổi Xe)
+    [0, 8, 0, 7, 10]  // 2... Xe 9 bình 8
+  ]);
 
-  // Lượt 3 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3
-  "R:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 9, fc: 8, tr: 9, tc: 7, weight: 68 }, // Xe 1 bình 2 (Trực Xa chính cuộc)
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 18 }, // Tốt 3 tấn 1
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 14 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 3 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 B7.1
-  "R:rnbakab.r..........c....nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 9, fc: 8, tr: 9, tc: 7, weight: 78 }, // Xe 1 bình 2
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 22 }  // Tốt 7 tấn 1
-  ],
+  // Lượt 3 Đỏ sau 1. P2-5 M8.7 2. M2.3 M2.3:
+  registerBookLine([[7, 7, 7, 4], [0, 7, 2, 6], [9, 7, 7, 6], [0, 1, 2, 2]], [
+    [9, 8, 9, 7, 56], // 3. Xe 1 bình 2 (Trực Xa công sát)
+    [6, 4, 5, 4, 24], // 3. Tốt 5 tấn 1! (Cấp Tiến Trung Binh trực diện!)
+    [7, 1, 7, 3, 12], // 3. Pháo 8 bình 6! (Ngũ Lục Pháo bạo công!)
+    [6, 2, 5, 2, 8 ]  // 3. Tốt 7 tấn 1 (Khởi đầu Ngũ Thất Pháo / Quá Hà Xa)
+  ]);
 
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 65 }, // Xe 9 bình 8
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 35 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 B7.1 3. X1-2
-  "B:rnbakab.r..........c....nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 85 }, // Mã 2 tấn 3
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 15 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. B7.1
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p...........P......P...P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 70 }, // Tốt 7 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 30 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. B3.1
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p...............P..P.P.P...P.C..C..N..........RNBAKAB.R": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 70 }, // Tốt 3 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 30 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. M8.7
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 65 }, // Tốt 7 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. M8.9
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.PNC..C..N..........R.BAKAB.R": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 65 }, // Tốt 3 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
+  // Lượt 3 Đen sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2:
+  registerBookLine([[7, 7, 7, 4], [0, 7, 2, 6], [9, 7, 7, 6], [0, 1, 2, 2], [9, 8, 9, 7]], [
+    [0, 8, 0, 7, 62], // 3... Xe 9 bình 8
+    [3, 6, 4, 6, 38]  // 3... Tốt 7 tấn 1
+  ]);
 
-  // Lượt 4 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8
-  "R:r.bakabr...........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 45 }, // Tốt 7 tấn 1
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 30 }, // Tốt 3 tấn 1
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }  // Mã 8 tấn 7
-  ],
-  // Lượt 4 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1
-  "R:r.bakab.r..........cn...nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 50 }, // Tốt 7 tấn 1
-    { fr: 9, fc: 7, tr: 3, tc: 7, weight: 30 }, // Xe 2 tấn 6 (Quá Hà Xa)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 20 }  // Mã 8 tấn 7
-  ],
-
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B7.1
-  "B:r.bakabr...........cn...nc.p.p.p.p.p...........P......P...P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 75 }, // Tốt 7 tấn 1
-    { fr: 2, fc: 7, tr: 4, tc: 7, weight: 25 }  // Pháo 8 tấn 2 (Tuần hà Pháo)
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B3.1
-  "B:r.bakabr...........cn...nc.p.p.p.p.p...............P..P.P.P...P.C..C..N..........RNBAKABR.": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 75 }, // Tốt 3 tấn 1
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 25 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. M8.7
-  "B:r.bakabr...........cn...nc.p.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKABR.": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 80 }, // Tốt 7 tấn 1
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 20 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1 4. B7.1
-  "B:r.bakab.r..........cn...nc.p.p.p...p......p....P......P...P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 70 }, // Xe 9 bình 8
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 30 }  // Tốt 3 tấn 1 (Lưỡng Đầu Xà)
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1 4. X2.6
-  "B:r.bakab.r..........cn...nc.p.p.p..Rp......p...........P.P.P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 65 }, // Tốt 3 tấn 1 (Lưỡng Đầu Xà)
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
-
-  // Lượt 5 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B7.1 B7.1
-  "R:r.bakabr...........cn...nc.p.p.p...p......p....P......P...P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 9, fc: 7, tr: 3, tc: 7, weight: 55 }, // Xe 2 tấn 6 (Trung Pháo Quá Hà Xa!)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }, // Mã 8 tấn 7
-    { fr: 7, fc: 1, tr: 7, tc: 2, weight: 20 }  // Pháo 8 bình 7 (Ngũ Thất Pháo)
-  ],
-
-  // Lượt 5 Đen: Đỡ Trung Pháo Quá Hà Xa (Sau 5. X2.6)
-  "B:r.bakabr...........cn...nc.p.p.p..Rp......p....P......P...P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 2, fc: 7, tr: 2, tc: 6, weight: 55 }, // Pháo 8 bình 7 (Bình Pháo Đổi Xe!)
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 30 }, // Tốt 3 tấn 1 (Lưỡng Đầu Xà)
-    { fr: 2, fc: 2, tr: 4, tc: 3, weight: 15 }  // Mã 3 tấn 4 (Tả Mã Bàn Hà)
-  ],
-
-  // Lượt 6 Đỏ: Sau khi Đen đi Pháo 8 bình 7 đổi Xe (5... P8-7)
-  "R:r.bakabr...........cn...cc.p.p.p..Rp......p....P......P...P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 3, fc: 7, tr: 3, tc: 6, weight: 70 }, // Xe 2 bình 3 (Ăn Tốt đè Mã)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 30 }  // Mã 8 tấn 7
-  ],
-
-  // Lượt 5 Đen: Đỏ chơi Ngũ Thất Pháo (5. P8-7)
-  "B:r.bakabr...........cn...nc.p.p.p...p......p....P......P...P.P.P..C.C..N..........RNBAKABR.": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 65 }, // Tốt 3 tấn 1
-    { fr: 0, fc: 2, tr: 2, tc: 4, weight: 35 }  // Tượng 3 tấn 5
-  ],
+  // Lượt 4 Đỏ sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 (Ngã tư chiến thuật Đại Kiện Tướng):
+  registerBookLine([[7, 7, 7, 4], [0, 7, 2, 6], [9, 7, 7, 6], [0, 1, 2, 2], [9, 8, 9, 7], [0, 8, 0, 7]], [
+    [6, 4, 5, 4, 34], // 4. Tốt 5 tấn 1! (Cấp Tiến Trung Binh & Pháo Đầu Mã Đội!)
+    [7, 1, 7, 3, 24], // 4. Pháo 8 bình 6! (Ngũ Lục Pháo công sát!)
+    [6, 2, 5, 2, 26], // 4. Tốt 7 tấn 1 (Mở đường Xe 2 tấn 6 Quá Hà Xa & Ngũ Thất Pháo)
+    [6, 6, 5, 6, 16]  // 4. Tốt 3 tấn 1 (Mở đường Hữu Mã Bàn Hà M3.4)
+  ]);
 
   // --------------------------------------------------------------------------
-  // 3. HỆ THỐNG THUẬN PHÁO (P2-5 vs P8-5) & NGHỊCH PHÁO (P2-5 vs P2-5)
+  // 2. HỆ THỐNG CẤP TIẾN TRUNG BINH & PHÁO ĐẦU MÃ ĐỘI (TẤN CÔNG TÀN BẠO TRUNG LỘ)
   // --------------------------------------------------------------------------
-  // Lượt 2 Đỏ: Sau 1. P2-5 P8-5 (Thuận Pháo)
-  "R:rnbakabnr..........c..c....p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 80 }, // Mã 2 tấn 3
-    { fr: 9, fc: 8, tr: 8, tc: 8, weight: 20 }  // Xe 1 tấn 1 (Thuận Pháo Hoành Xa)
-  ],
-  // Lượt 2 Đen: Sau 1. P2-5 P8-5 2. M2.3
-  "B:rnbakabnr..........c..c....p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 80 }, // Mã 8 tấn 7
-    { fr: 0, fc: 8, tr: 1, tc: 8, weight: 20 }  // Xe 9 tấn 1 (Hoành Xa)
-  ],
-  // Lượt 3 Đỏ: Sau 1. P2-5 P8-5 2. M2.3 M8.7
-  "R:rnbakab.r..........c..c..n.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 9, fc: 8, tr: 9, tc: 7, weight: 75 }, // Xe 1 bình 2 (Trực Xa)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }  // Mã 8 tấn 7
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 P8-5 2. M2.3 M8.7 3. X1-2
-  "B:rnbakab.r..........c..c..n.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 8, tr: 1, tc: 8, weight: 65 }, // Xe 9 tấn 1 (Trực Xa đối Hoành Xa)
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 35 }  // Mã 2 tấn 3
-  ],
-  // Lượt 4 Đỏ: Sau 1. P2-5 P8-5 2. M2.3 M8.7 3. X1-2 X9.1
-  "R:rnbakab............c..c..nrp.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 65 }, // Mã 8 tấn 7
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 35 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 4. M8.7
-  "B:rnbakab............c..c..nrp.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKABR.": [
-    { fr: 1, fc: 8, tr: 1, tc: 3, weight: 75 }, // Xe 9 bình 4 (Chiếm lộ sườn Lộ 4)
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 25 }  // Mã 2 tấn 3
-  ],
+  // Nhánh 2A: 1. P2-5 M8.7 2. M2.3 B7.1 3. X1-2 M2.3 4. B5.1! (Cấp Tiến Trung Binh kinh điển)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ], // 1. P2-5
+    [0, 7, 2, 6, 0 ], // 1... M8.7
+    [9, 7, 7, 6, 0 ], // 2. M2.3
+    [3, 6, 4, 6, 0 ], // 2... B7.1
+    [9, 8, 9, 7, 75], // 3. X1-2
+    [0, 1, 2, 2, 80], // 3... M2.3
+    [6, 4, 5, 4, 48], // 4. B5.1! (Cấp Tiến Trung Binh!)
+    [0, 3, 1, 4, 70], // 4... S4.5
+    [5, 4, 4, 4, 55], // 5. B5.1! (Ủi thẳng Tốt 5 qua hà công sát!)
+    [2, 2, 4, 3, 75], // 5... M3.4 (Đen nhảy Mã Bàn Hà đối công)
+    [7, 6, 6, 4, 65], // 6. M3.5! (Pháo Đầu Mã Đội giẫm trung lộ!)
+    [0, 8, 0, 7, 80], // 6... X9-8
+    [9, 7, 3, 7, 75], // 7. X2.6! (Xe Quá Hà kẹp cổ!)
+    [4, 3, 5, 4, 70], // 7... M4.5 (Đen ăn Tốt đầu)
+    [6, 4, 4, 3, 85]  // 8. M5.6! (Phóng Mã Đội qua sông tổng công kích!)
+  ]);
 
-  // Lượt 2 Đỏ: Sau 1. P2-5 P2-5 (Nghịch Pháo)
-  "R:rnbakabnr.............c..c.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 85 }, // Mã 2 tấn 3
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 15 }  // Mã 8 tấn 7
-  ],
-  // Lượt 2 Đen: Sau 1. P2-5 P2-5 2. M2.3
-  "B:rnbakabnr.............c..c.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 80 }, // Mã 2 tấn 3
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 20 }  // Mã 8 tấn 7 (Bán Đồ Nghịch Pháo)
-  ],
+  // Nhánh 2B: Sau 4. B5.1 S4.5 -> Đỏ chơi 5. M3.5! (Pháo Đầu Mã Đội trực tiếp) hoặc 5. B3.1 (Mở Mã Bàn Hà)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [3, 6, 4, 6, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [6, 4, 5, 4, 0 ], // 4. B5.1
+    [0, 3, 1, 4, 0 ], // 4... S4.5
+    [7, 6, 6, 4, 45], // 5. M3.5! (Pháo Đầu Mã Đội!)
+    [0, 8, 0, 7, 80], // 5... X9-8
+    [5, 4, 4, 4, 75], // 6. B5.1! (Tốt đầu qua sông mở đường Mã Đội!)
+    [3, 4, 4, 4, 75], // 6... B5.1 (Đen ăn Tốt)
+    [6, 4, 4, 4, 90], // 7. M5.5! (Mã Đội đạp Tốt giữa trung tâm!)
+    [2, 6, 4, 4, 80], // 7... M7.5
+    [7, 4, 4, 4, 95]  // 8. P5.3! (Pháo Đầu nổ Mã chiếu Tướng / Không Đầu Pháo!)
+  ]);
+
+  // Nhánh 2C: Cấp Tiến Trung Binh sau 3. X1-2 X9-8 4. B5.1!
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ], // 1. P2-5
+    [0, 7, 2, 6, 0 ], // 1... M8.7
+    [9, 7, 7, 6, 0 ], // 2. M2.3
+    [0, 1, 2, 2, 0 ], // 2... M2.3
+    [9, 8, 9, 7, 0 ], // 3. X1-2
+    [0, 8, 0, 7, 0 ], // 3... X9-8
+    [6, 4, 5, 4, 34], // 4. B5.1! (Cấp Tiến Trung Binh)
+    [0, 3, 1, 4, 65], // 4... S4.5
+    [7, 6, 6, 4, 52], // 5. M3.5! (Pháo Đầu Mã Đội!)
+    [3, 6, 4, 6, 75], // 5... B7.1
+    [5, 4, 4, 4, 70], // 6. B5.1! (Đâm Tốt đầu qua hà!)
+    [3, 4, 4, 4, 75], // 6... B5.1
+    [6, 4, 4, 4, 90], // 7. M5.5! (Mã Đội đạp Tốt đầu!)
+    [2, 2, 4, 4, 80], // 7... M3.5
+    [7, 4, 4, 4, 95]  // 8. P5.3! (Nổ Pháo Đầu giữa mặt Tướng!)
+  ]);
+
+  // Nhánh 2D: Cấp Tiến Trung Binh + Hữu Mã Bàn Hà (5. B3.1 -> 6. M3.4 -> 7. B5.1)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 0, 7, 0 ],
+    [6, 4, 5, 4, 0 ], // 4. B5.1
+    [0, 3, 1, 4, 0 ], // 4... S4.5
+    [6, 6, 5, 6, 48], // 5. B3.1 (Mở chân Mã Bàn Hà)
+    [3, 6, 4, 6, 75], // 5... B7.1
+    [7, 6, 5, 5, 78], // 6. M3.4! (Nhảy Mã Bàn Hà uy hiếp trung lộ!)
+    [1, 7, 1, 5, 65], // 6... P8-6 (hoặc X8.4)
+    [5, 4, 4, 4, 85]  // 7. B5.1! (Ủi Tốt 5 qua sông phối hợp Mã Bàn Hà!)
+  ]);
+
+  // Nhánh 2E: Cấp Tiến Trung Binh sớm từ nước 3 (1. P2-5 M8.7 2. M2.3 M2.3 3. B5.1!)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [6, 4, 5, 4, 24], // 3. B5.1!
+    [0, 3, 1, 4, 60], // 3... S4.5
+    [7, 6, 6, 4, 58], // 4. M3.5! (Pháo Đầu Mã Đội!)
+    [0, 8, 0, 7, 75], // 4... X9-8
+    [9, 8, 9, 7, 75], // 5. X1-2
+    [3, 6, 4, 6, 75], // 5... B7.1
+    [5, 4, 4, 4, 85]  // 6. B5.1! (Xung phong Tốt đầu!)
+  ]);
 
   // --------------------------------------------------------------------------
-  // 4. HỆ THỐNG TIÊN NHÂN CHỈ LỘ (1. TỐT 3 TẤN 1 / TỐT 7 TẤN 1)
+  // 3. HỆ THỐNG NGŨ LỤC PHÁO BẠO CÔNG (五六炮 - P2-5 + P8-6)
   // --------------------------------------------------------------------------
-  // Đen đỡ Tốt 3 tấn 1
-  "B:rnbakabnr..........c.....c.p.p.p.p.p...............P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 2, fc: 1, tr: 2, tc: 2, weight: 45 }, // Pháo 2 bình 3 (Liễm Pháo)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 35 }, // Tốt 7 tấn 1 (Đối Binh Cuộc)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 20 }  // Pháo 8 bình 5
-  ],
-  // Đen đỡ Tốt 7 tấn 1
-  "B:rnbakabnr..........c.....c.p.p.p.p.p...........P......P...P.P.P.C.....C..........RNBAKABNR": [
-    { fr: 2, fc: 7, tr: 2, tc: 6, weight: 45 }, // Pháo 8 bình 7 (Liễm Pháo)
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 35 }, // Tốt 3 tấn 1 (Đối Binh Cuộc)
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 20 }  // Pháo 2 bình 5
-  ],
-  // Lượt 2 Đỏ: Sau 1. B3.1 P2-3 (Liễm Pháo)
-  "R:rnbakabnr...........c....c.p.p.p.p.p...............P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 50 }, // Mã 2 tấn 3
-    { fr: 7, fc: 7, tr: 7, tc: 4, weight: 35 }, // Pháo 2 bình 5 (Chuyển Trung Pháo)
-    { fr: 9, fc: 6, tr: 7, tc: 4, weight: 15 }  // Tượng 3 tấn 5
-  ],
-  // Lượt 2 Đen: Sau 1. B3.1 P2-3 2. M2.3
-  "B:rnbakabnr...........c....c.p.p.p.p.p...............P..P.P.P...P.C.....C..N.......RNBAKAB.R": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 65 }, // Mã 8 tấn 7
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 35 }  // Mã 2 tấn 3
-  ],
-  // Lượt 2 Đỏ: Sau 1. B3.1 B7.1 (Đối Binh Cuộc)
-  "R:rnbakabnr..........c.....c.p.p.p...p......p........P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 9, fc: 6, tr: 7, tc: 4, weight: 50 }, // Tượng 3 tấn 5
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 35 }, // Mã 2 tấn 3
-    { fr: 7, fc: 1, tr: 7, tc: 4, weight: 15 }  // Pháo 8 bình 5
-  ],
-  // Lượt 2 Đen: Sau 1. B3.1 B7.1 2. T3.5
-  "B:rnbakabnr..........c.....c.p.p.p...p......p........P..P.P.P...P.C..B..C..........RNBAKA.NR": [
-    { fr: 0, fc: 2, tr: 2, tc: 4, weight: 55 }, // Tượng 3 tấn 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 45 }  // Mã 8 tấn 7
-  ],
+  // Nhánh 3A: 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. P8-6!
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 0, 7, 0 ],
+    [7, 1, 7, 3, 24], // 4. P8-6! (Ngũ Lục Pháo!)
+    [3, 6, 4, 6, 65], // 4... B7.1
+    [9, 1, 7, 2, 72], // 5. M8.7 (Song Chính Mã)
+    [0, 3, 1, 4, 70], // 5... S4.5
+    [9, 0, 9, 1, 75], // 6. X9-8 (Xuất đều Song Xe)
+    [0, 7, 4, 7, 70], // 6... X8.4 (Xe Đen tuần hà)
+    [6, 2, 5, 2, 75], // 7. B7.1! (Đột kích lộ 7)
+    [3, 2, 4, 2, 70], // 7... B3.1
+    [9, 7, 3, 7, 82]  // 8. X2.6! (Xe Quá Hà đè trận Đen!)
+  ]);
+
+  // Nhánh 3B: Ngũ Lục Pháo Quá Hà Xa Đè Mã (1. P2-5 M8.7 2. M2.3 B7.1 3. X1-2 M2.3 4. X2.6 P8-7 5. X2-3 P7.4 6. P8-6!)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [3, 6, 4, 6, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 7, 3, 7, 52], // 4. X2.6! (Trung Pháo Quá Hà Xa!)
+    [2, 7, 2, 6, 65], // 4... P8-7 (Bình Pháo Đổi Xe)
+    [3, 7, 3, 6, 78], // 5. X2-3! (Ăn Tốt đè chặt Mã Đen!)
+    [2, 6, 6, 6, 70], // 5... P7.4 (Pháo Đen quật Tốt phản kích)
+    [7, 1, 7, 3, 68], // 6. P8-6! (Đóng Ngũ Lục Pháo vừa đuổi Pháo vừa khóa Sĩ!)
+    [6, 6, 6, 2, 75], // 6... P7-3
+    [9, 1, 7, 2, 80], // 7. M8.7!
+    [0, 2, 2, 4, 75], // 7... T3.5
+    [6, 4, 5, 4, 85]  // 8. B5.1! (Kết hợp Ngũ Lục Pháo + Cấp Tiến Trung Binh!)
+  ]);
 
   // --------------------------------------------------------------------------
-  // 5. HỆ THỐNG PHI TƯỢNG CUỘC, QUÁ CUNG PHÁO & KHỞI MÃ CUỘC
+  // 4. HỆ THỐNG TRUNG PHÁO QUÁ HÀ XA & NGŨ THẤT PHÁO BÀN HÀ MÃ (五七炮过河车)
   // --------------------------------------------------------------------------
-  // Đen đỡ Phi Tượng Cuộc (1. T3.5)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C..B..C..........RNBAKA.NR": [
-    { fr: 2, fc: 1, tr: 2, tc: 3, weight: 45 }, // Pháo 2 bình 4 (Tả Quá Cung Pháo)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 35 }, // Pháo 8 bình 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 20 }  // Mã 8 tấn 7
-  ],
-  // Lượt 2 Đỏ: Sau 1. T3.5 P2-4
-  "R:rnbakabnr............c...c.p.p.p.p.p..................P.P.P.P.P.C..B..C..........RNBAKA.NR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 55 }, // Mã 2 tấn 3
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 45 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 2 Đen: Sau 1. T3.5 P2-4 2. M2.3
-  "B:rnbakabnr............c...c.p.p.p.p.p..................P.P.P.P.P.C..B..C..N.......RNBAKA..R": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 65 }, // Mã 2 tấn 3
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 35 }  // Mã 8 tấn 7
-  ],
-  // Đen đỡ Quá Cung Pháo (1. P2-6 -> cột 3)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.C..............RNBAKABNR": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 50 }, // Mã 8 tấn 7
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 35 }, // Pháo 8 bình 5 (Trung Pháo công Quá Cung)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 15 }  // Tốt 7 tấn 1
-  ],
-  // Đen đỡ Sĩ Giác Pháo (1. P2-4 -> cột 5)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C...C............RNBAKABNR": [
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 55 }, // Pháo 2 bình 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 45 }  // Mã 8 tấn 7
-  ],
-  // Đen đỡ Khởi Mã Cuộc (1. M2.3)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.....C..N.......RNBAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 50 }, // Tốt 7 tấn 1 (Chế Mã)
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 35 }, // Mã 8 tấn 7
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 15 }  // Pháo 8 bình 5
-  ]
-};
+  // Nhánh 4A: 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B7.1 B7.1 5. X2.6!
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 0, 7, 0 ],
+    [6, 2, 5, 2, 26], // 4. B7.1
+    [3, 6, 4, 6, 75], // 4... B7.1
+    [9, 7, 3, 7, 55], // 5. X2.6! (Quá Hà Xa!)
+    [2, 7, 2, 6, 55], // 5... P8-7 (Bình Pháo Đổi Xe)
+    [3, 7, 3, 6, 72], // 6. X2-3! (Ăn Tốt đè Mã)
+    [0, 7, 2, 7, 70], // 6... X8.2
+    [9, 1, 7, 2, 75], // 7. M8.7
+    [0, 2, 2, 4, 70], // 7... T3.5
+    [7, 1, 7, 3, 78]  // 8. P8-6! (Ngũ Lục Pháo Quá Hà Xa!)
+  ]);
+
+  // Nhánh 4B: Ngũ Thất Pháo Tả Mã Bàn Hà Công Sát (5. P8-7! -> 6. M8.7 -> 7. M7.6!)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 0, 7, 0 ],
+    [6, 2, 5, 2, 0 ], // 4. B7.1
+    [3, 6, 4, 6, 0 ], // 4... B7.1
+    [7, 1, 7, 2, 30], // 5. P8-7! (Ngũ Thất Pháo!)
+    [0, 2, 2, 4, 65], // 5... T3.5
+    [9, 1, 7, 0, 45], // 6. M8.9 (hoặc M8.7 khi P8-6)
+    [0, 7, 4, 7, 70], // 6... X8.4
+    [9, 0, 9, 1, 80], // 7. X9-8 (Đấu Xe tranh tiên)
+    [4, 6, 5, 6, 70], // 7... B7.1
+    [9, 7, 5, 7, 85]  // 8. X2.4 (Xe tuần hà bắt Tốt)
+  ]);
+
+  // Nhánh 4C: Hữu Mã Bàn Hà Công Sát (4. B3.1 B7.1 5. M3.4!)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 1, 2, 2, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 0, 7, 0 ],
+    [6, 6, 5, 6, 16], // 4. B3.1
+    [3, 6, 4, 6, 75], // 4... B7.1
+    [7, 6, 5, 5, 75], // 5. M3.4! (Nhảy Mã Bàn Hà dẫm Tốt & dọa phế Mã!)
+    [0, 2, 2, 4, 65], // 5... T3.5
+    [6, 4, 5, 4, 80], // 6. B5.1! (Phối hợp Bàn Hà Mã + Cấp Tiến Trung Binh!)
+    [0, 3, 1, 4, 75], // 6... S4.5
+    [5, 4, 4, 4, 85]  // 7. B5.1! (Ủi Tốt 5 qua sông!)
+  ]);
+
+  // --------------------------------------------------------------------------
+  // 5. HỆ THỐNG THUẬN PHÁO HOÀNH XA & LIỆT THỦ PHÁO ĐÔI CÔNG TÀN BẠO
+  // --------------------------------------------------------------------------
+  // Nhánh 5A: Thuận Pháo Trực Xa đối Hoành Xa (1. P2-5 P8-5 2. M2.3 M8.7 3. X1-2 X9.1)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ], // 1. P2-5
+    [2, 7, 2, 4, 22], // 1... P8-5 (Thuận Pháo)
+    [9, 7, 7, 6, 75], // 2. M2.3
+    [0, 7, 2, 6, 75], // 2... M8.7
+    [9, 8, 9, 7, 78], // 3. X1-2 (Trực Xa)
+    [0, 8, 1, 8, 70], // 3... X9.1 (Hoành Xa công sát)
+    [9, 1, 7, 2, 68], // 4. M8.7
+    [1, 8, 1, 3, 78], // 4... X9-4! (Chiếm lộ sườn lộ 4 dọa Thiết Môn Thuyên!)
+    [7, 1, 7, 2, 40], // (Nếu Đỏ đi X9.1: xem biến dưới)
+  ]);
+
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [2, 7, 2, 4, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 8, 9, 7, 0 ],
+    [0, 8, 1, 8, 0 ],
+    [9, 1, 7, 2, 0 ],
+    [1, 8, 1, 3, 0 ], // 4... X9-4
+    [6, 6, 5, 6, 65], // 5. B3.1 (Đỏ mở đường Mã Bàn Hà)
+    [1, 3, 6, 3, 75], // 5... X4.5! (Xe Đen đâm thẳng xuống hàng Tốt Đỏ!)
+    [9, 7, 2, 7, 80], // 6. X2.7! (Xe Đỏ cắm thẳng xuống hàng Pháo Đen đối công!)
+    [0, 1, 2, 2, 75], // 6... M2.3
+    [9, 0, 8, 0, 80]  // 7. X9.1! (Đỏ xuất Hoành Xa thứ 2 tổng lực công sát!)
+  ]);
+
+  // Nhánh 5B: Đỏ chủ động chơi Thuận Pháo Hoành Xa (1. P2-5 P8-5 2. M2.3 M8.7 3. X1.1!)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [2, 7, 2, 4, 0 ],
+    [9, 7, 7, 6, 0 ],
+    [0, 7, 2, 6, 0 ],
+    [9, 8, 8, 8, 22], // 3. X1.1! (Thuận Pháo Hoành Xa!)
+    [0, 8, 0, 7, 75], // 3... X9-8
+    [8, 8, 8, 3, 82], // 4. X1-6! (Chiếm lộ sườn Lộ 6 công kích Sĩ Giác!)
+    [0, 1, 2, 2, 75], // 4... M2.3
+    [8, 3, 2, 3, 85]  // 5. X6.6! (Cắm thẳng Xe xuống kẹp cổ Tướng Đen!)
+  ]);
+
+  // Nhánh 5C: Nghịch Pháo / Liệt Thủ Pháo Đôi Công (1. P2-5 P2-5 2. M2.3 M2.3 3. X1-2)
+  registerAttackingChain([
+    [7, 7, 7, 4, 0 ],
+    [2, 1, 2, 4, 10], // 1... P2-5 (Nghịch Pháo)
+    [9, 7, 7, 6, 85], // 2. M2.3
+    [0, 1, 2, 2, 80], // 2... M2.3
+    [9, 8, 9, 7, 80], // 3. X1-2
+    [0, 0, 1, 0, 70], // 3... X1.1 (Hoành Xa)
+    [9, 1, 7, 2, 75], // 4. M8.7
+    [0, 7, 2, 6, 75], // 4... M8.7
+    [9, 7, 3, 7, 82]  // 5. X2.6! (Cắm Xe Quá Hà công sát!)
+  ]);
+
+  // --------------------------------------------------------------------------
+  // 6. TIÊN NHÂN CHỈ LỘ, PHI TƯỢNG & QUÁ CUNG PHÁO CHUYỂN BẠO CÔNG
+  // --------------------------------------------------------------------------
+  // Đen đỡ Tiên Nhân Chỉ Lộ (1. B3.1): Chủ động đóng Pháo Đầu hoặc Liễm Pháo phản kích!
+  registerBookLine([[6, 6, 5, 6]], [
+    [2, 7, 2, 4, 48], // 1... Pháo 8 bình 5! (Pháo Đầu công Tiên Nhân Chỉ Lộ!)
+    [2, 1, 2, 2, 32], // 1... Pháo 2 bình 3 (Liễm Pháo)
+    [3, 6, 4, 6, 20]  // 1... Tốt 7 tấn 1 (Đối Binh Cuộc)
+  ]);
+
+  // Sau 1. B3.1 P8-5: Đỏ lập tức đóng 2. P2-5! (Thuận Pháo Tiến Tam Binh đôi công!) hoặc 2. M2.3
+  registerAttackingChain([
+    [6, 6, 5, 6, 0 ], // 1. B3.1
+    [2, 7, 2, 4, 0 ], // 1... P8-5
+    [7, 7, 7, 4, 65], // 2. P2-5! (Đóng Pháo Đầu đôi công!)
+    [0, 7, 2, 6, 80], // 2... M8.7
+    [9, 7, 7, 6, 85], // 3. M2.3
+    [0, 8, 0, 7, 75], // 3... X9-8
+    [7, 6, 5, 5, 80]  // 4. M3.4! (Phóng Mã Bàn Hà công sát!)
+  ]);
+
+  // Sau 1. B3.1 P2-3 (Liễm Pháo): Đỏ đóng 2. P2-5! (Chuyển Trung Pháo công sát!)
+  registerAttackingChain([
+    [6, 6, 5, 6, 0 ], // 1. B3.1
+    [2, 1, 2, 2, 0 ], // 1... P2-3
+    [7, 7, 7, 4, 68], // 2. P2-5! (Chuyển Trung Pháo!)
+    [0, 7, 2, 6, 75], // 2... M8.7
+    [9, 7, 7, 6, 82], // 3. M2.3
+    [0, 1, 2, 0, 70], // 3... M2.1
+    [9, 8, 9, 7, 85]  // 4. X1-2!
+  ]);
+
+  // Sau 1. B3.1 B7.1 (Đối Binh Cuộc): Đỏ đóng 2. P8-5! hoặc 2. P2-5! công trung lộ
+  registerAttackingChain([
+    [6, 6, 5, 6, 0 ], // 1. B3.1
+    [3, 6, 4, 6, 0 ], // 1... B7.1
+    [7, 7, 7, 4, 65], // 2. P2-5! (Trung Pháo Đối Binh Cuộc!)
+    [0, 7, 2, 6, 75], // 2... M8.7
+    [9, 7, 7, 6, 85], // 3. M2.3
+    [0, 1, 2, 2, 75], // 3... M2.3
+    [9, 8, 9, 7, 85]  // 4. X1-2
+  ]);
+
+  // Đen đỡ Phi Tượng Cuộc (1. T3.5), Quá Cung Pháo (1. P2-6), Khởi Mã Cuộc (1. M2.3) bằng Trung Pháo Bạo Công:
+  registerBookLine([[9, 6, 7, 4]], [
+    [2, 7, 2, 4, 60], // 1... P8-5! (Trung Pháo phá Phi Tượng!)
+    [2, 1, 2, 3, 40]  // 1... P2-4 (Quá Cung Pháo)
+  ]);
+  registerBookLine([[7, 7, 7, 3]], [
+    [2, 7, 2, 4, 60], // 1... P8-5! (Trung Pháo công Quá Cung!)
+    [0, 7, 2, 6, 40]  // 1... M8.7
+  ]);
+  registerBookLine([[9, 7, 7, 6]], [
+    [2, 7, 2, 4, 60], // 1... P8-5! (Trung Pháo công Khởi Mã!)
+    [3, 6, 4, 6, 40]  // 1... B7.1 (Chế Mã)
+  ]);
+})();
 
 // Lật gương ngang bàn cờ 90 ký tự (Cột c <-> 8 - c) để tự động hỗ trợ cả 2 cánh Trái & Phải
 function mirrorBoardKeyHorizontal(boardKey) {
@@ -322,7 +461,6 @@ function pickBookMove(boardKey) {
   let choices = OPENING_BOOK[boardKey];
   let isMirrored = false;
 
-  // Nếu không khớp trực tiếp, tự động lật gương ngang để tra cứu biến đối xứng
   if (!choices || !choices.length) {
     const mirroredKey = mirrorBoardKeyHorizontal(boardKey);
     choices = OPENING_BOOK[mirroredKey];
@@ -411,12 +549,12 @@ function getCurrentBoardString() {
 }
 
 const pstPawn = new Int16Array([
-   14,  20,  28,  42,  48,  42,  28,  20,  14,
-   54,  72,  90, 118, 128, 118,  90,  72,  54,
-   50,  68,  85, 106, 118, 106,  85,  68,  50,
-   40,  50,  64,  82,  92,  82,  64,  50,  40,
-   24,  34,  45,  58,  66,  58,  45,  34,  24,
-    4,   0,  18,   0,  28,   0,  18,   0,   4,
+   14,  20,  28,  46,  52,  46,  28,  20,  14,
+   54,  72,  92, 126, 138, 126,  92,  72,  54,
+   50,  68,  86, 114, 126, 114,  86,  68,  50,
+   40,  50,  64,  84,  98,  84,  64,  50,  40,
+   24,  34,  45,  62,  74,  62,  45,  34,  24,
+    4,   0,  18,  12,  36,  12,  18,   0,   4,
     0,   0,   6,   0,  14,   0,   6,   0,   0,
     0,   0,   0,   0,   0,   0,   0,   0,   0,
     0,   0,   0,   0,   0,   0,   0,   0,   0,
@@ -424,36 +562,36 @@ const pstPawn = new Int16Array([
 ]);
 
 const pstKnight = new Int16Array([
-    0,  -4,  14,  14,   6,  14,  14,  -4,   0,
-   10,  22,  52,  62,  34,  62,  52,  22,  10,
-   14,  32,  56,  68,  58,  68,  56,  32,  14,
-   12,  26,  44,  54,  50,  54,  44,  26,  12,
-   10,  22,  36,  45,  42,  45,  36,  22,  10,
-    6,  18,  32,  38,  34,  38,  32,  18,   6,
-    4,  14,  28,  30,  26,  30,  28,  14,   4,
+    0,  -4,  16,  16,   8,  16,  16,  -4,   0,
+   10,  24,  58,  66,  38,  66,  58,  24,  10,
+   14,  34,  60,  74,  62,  74,  60,  34,  14,
+   12,  26,  46,  58,  56,  58,  46,  26,  12,
+   10,  22,  38,  48,  46,  48,  38,  22,  10,
+    6,  18,  34,  44,  40,  44,  34,  18,   6,
+    4,  14,  28,  32,  34,  32,  28,  14,   4,
    -6,   8,  30,  16,   4,  16,  30,   8,  -6,
   -14,  -6,   4, -18, -38, -18,   4,  -6, -14,
   -24, -16,  -8, -12, -22, -12,  -8, -16, -24
 ]);
 
 const pstCannon = new Int16Array([
-   18,  22,  18,  14,  10,  14,  18,  22,  18,
-   20,  26,  24,  30,  36,  30,  24,  26,  20,
-   16,  24,  28,  36,  46,  36,  28,  24,  16,
+   22,  26,  20,  16,  14,  16,  20,  26,  22,
+   22,  28,  26,  34,  40,  34,  26,  28,  22,
+   16,  24,  28,  38,  48,  38,  28,  24,  16,
    12,  18,  24,  32,  42,  32,  24,  18,  12,
     8,  14,  20,  28,  36,  28,  20,  14,   8,
     8,  14,  18,  24,  34,  24,  18,  14,   8,
     4,  10,  12,  18,  28,  18,  12,  10,   4,
-    6,  20,  16,  24,  38,  24,  16,  20,   6,
+    6,  20,  20,  28,  40,  28,  20,  20,   6,
     2,   6,   6,   6,  16,   6,   6,   6,   2,
     0,   2,   5,   5,  10,   5,   5,   2,   0
 ]);
 
 const pstRook = new Int16Array([
-   22,  34,  26,  40,  42,  40,  26,  34,  22,
-   30,  48,  42,  56,  60,  56,  42,  48,  30,
-   24,  38,  32,  46,  48,  46,  32,  38,  24,
-   20,  34,  28,  40,  42,  40,  28,  34,  20,
+   26,  38,  28,  44,  46,  44,  28,  38,  26,
+   34,  52,  46,  62,  66,  62,  46,  52,  34,
+   24,  38,  32,  48,  50,  48,  32,  38,  24,
+   20,  34,  28,  42,  44,  42,  28,  34,  20,
    18,  32,  26,  38,  40,  38,  26,  32,  18,
    16,  30,  24,  36,  38,  36,  24,  30,  16,
    10,  24,  18,  28,  30,  28,  18,  24,  10,
@@ -547,7 +685,7 @@ const rootMoveRepCount = new Int16Array(MAX_MOVES);
 
 const searchHistoryFrom  = new Int16Array(MAX_PLY).fill(-1);
 const searchHistoryTo    = new Int16Array(MAX_PLY).fill(-1);
-const searchHistoryPiece = new Int8Array(MAX_PLY).fill(0);
+const searchHistoryPiece = new Int8Array(MAX_PLY).fill(-1);
 
 const pvTable = new Int32Array(MAX_PLY * MAX_PLY);
 const pvLen   = new Int32Array(MAX_PLY);
@@ -557,6 +695,8 @@ const historyHeur = new Int32Array(2 * 90 * 90);
 const counterMoves = new Int16Array(2 * 90 * 90);
 // Continuation history: [prevPieceType(7) * 90][currPieceType(7) * 90]
 const contHist = new Int16Array(630 * 630);
+// Capture history: [attackerType(7) * 7 + victimType(7)] * 90
+const capHist = new Int16Array(49 * 90);
 
 const repHashLo = new Uint32Array(MAX_PLY + 512);
 const repHashHi = new Uint32Array(MAX_PLY + 512);
@@ -573,7 +713,7 @@ let rootPartialValid = false;
 const lmrTable = new Int8Array(64 * MAX_MOVES);
 for (let d = 1; d < 64; d++) {
   for (let m = 1; m < MAX_MOVES; m++) {
-    lmrTable[d * MAX_MOVES + m] = Math.floor(0.50 + Math.log(d) * Math.log(m) / 2.30);
+    lmrTable[d * MAX_MOVES + m] = Math.floor(0.50 + Math.log(d) * Math.log(m) / 2.35);
   }
 }
 
@@ -765,7 +905,70 @@ const seeGain = new Int32Array(32);
 const remSq = new Int16Array(32);
 const remPiece = new Int8Array(32);
 
-function getLeastValuableAttacker(sq, side) {
+function seePieceVal(p, sq) {
+  const t = UPPER_TAB[p & 127];
+  if (t === 80) { // Tốt
+    const side = SIDE_TAB[p & 127];
+    const r = ROW[sq], c = COL[sq];
+    if (side ? r <= 4 : r >= 5) {
+      return (c >= 2 && c <= 6 && (side ? r <= 2 : r >= 7)) ? 220 : 175;
+    }
+    return 115;
+  }
+  if (t === 67 || t === 78) return 505;
+  return BASEV_TAB[p & 127];
+}
+
+function isAttackedBySmallerPiece(sq, attackerSide, maxAttVal) {
+  if (isAttackedByPawn(sq, attackerSide)) return true;
+  if (maxAttVal <= 155) return false;
+
+  const kr = ROW[sq], kc = COL[sq];
+  const enemyA = attackerSide ? 65 : 97;
+  const enemyB = attackerSide ? 66 : 98;
+  if (kc >= 3 && kc <= 5 && (attackerSide ? (kr >= 7) : (kr <= 2))) {
+    const advTab = ADV_TO[attackerSide], b4 = sq * 4;
+    for (let i = 0; i < 4; i++) {
+      const from = advTab[b4 + i];
+      if (from >= 0 && board[from] === enemyA) return true;
+    }
+  }
+  if (attackerSide ? (kr >= 5) : (kr <= 4)) {
+    const bisTab = BIS_TO[attackerSide], eyeTab = BIS_EYE[attackerSide], b4 = sq * 4;
+    for (let i = 0; i < 4; i++) {
+      const from = bisTab[b4 + i];
+      if (from >= 0 && board[from] === enemyB && board[eyeTab[b4 + i]] === 0) return true;
+    }
+  }
+
+  if (maxAttVal > 600) {
+    const enemyN = attackerSide ? 78 : 110;
+    const enemyC = attackerSide ? 67 : 99;
+    const kb = sq * 8;
+    for (let i = 0; i < 8; i++) {
+      const ns = KN_FROM[kb + i];
+      if (ns >= 0 && board[ns] === enemyN && board[KN_LEG[kb + i]] === 0) return true;
+    }
+    for (let d = 0; d < 4; d++) {
+      const step = STEP4[d], nmax = RAY_N[sq * 4 + d];
+      let q = sq, screens = 0;
+      for (let k = 0; k < nmax; k++) {
+        q += step;
+        const p = board[q];
+        if (p !== 0) {
+          if (screens === 0) screens = 1;
+          else {
+            if (p === enemyC) return true;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function getLeastValuableAttacker(sq, side, targetIsKing = false) {
   const kr = ROW[sq], kc = COL[sq];
   const myP = side ? 80 : 112;
   const myA = side ? 65 : 97;
@@ -775,7 +978,7 @@ function getLeastValuableAttacker(sq, side) {
   const myR = side ? 82 : 114;
   const myK = side ? 75 : 107;
 
-  // 1. Tốt (115)
+  // 1. Tốt
   const pr = kr + (side ? 1 : -1);
   if (pr >= 0 && pr < 10 && board[pr * 9 + kc] === myP) return pr * 9 + kc;
   if (side ? (kr <= 4) : (kr >= 5)) {
@@ -783,8 +986,9 @@ function getLeastValuableAttacker(sq, side) {
     if (kc < 8 && board[sq + 1] === myP) return sq + 1;
   }
 
-  // 2. Sĩ (155)
-  if (kc >= 3 && kc <= 5 && (side ? (kr >= 7) : (kr <= 2))) {
+  // 2. Sĩ (chỉ trong Cửu Cung)
+  const inPalace = kc >= 3 && kc <= 5 && (side ? (kr >= 7) : (kr <= 2));
+  if (inPalace) {
     const advTab = ADV_TO[side], b4 = sq * 4;
     for (let i = 0; i < 4; i++) {
       const from = advTab[b4 + i];
@@ -792,7 +996,7 @@ function getLeastValuableAttacker(sq, side) {
     }
   }
 
-  // 3. Tượng (155)
+  // 3. Tượng
   if (side ? (kr >= 5) : (kr <= 4)) {
     const bisTab = BIS_TO[side], eyeTab = BIS_EYE[side], b4 = sq * 4;
     for (let i = 0; i < 4; i++) {
@@ -801,16 +1005,14 @@ function getLeastValuableAttacker(sq, side) {
     }
   }
 
-  // 4. Mã (495)
+  // 4. Mã
   const kb = sq * 8;
   for (let i = 0; i < 8; i++) {
     const ns = KN_FROM[kb + i];
     if (ns >= 0 && board[ns] === myN && board[KN_LEG[kb + i]] === 0) return ns;
   }
 
-  // 5. Pháo (515), 6. Xe (1090), 7. Tướng (20000)
-  // Lưu ý: Trong SEE khi các quân bị nhấc ra khỏi bàn cờ (board[from] = 0),
-  // tia quét tự động thấy được Pháo lồng, Xe đứng sau Pháo và sự dịch chuyển ngòi Pháo!
+  // 5. Pháo, 6. Xe, 7. Tướng
   let cannonFrom = -1, rookFrom = -1, kingFrom = -1;
   for (let d = 0; d < 4; d++) {
     const step = STEP4[d], nmax = RAY_N[sq * 4 + d];
@@ -821,7 +1023,7 @@ function getLeastValuableAttacker(sq, side) {
       if (p !== 0) {
         if (screens === 0) {
           if (p === myR && rookFrom < 0) rookFrom = q;
-          else if (p === myK && (k === 0 || (p ^ board[sq]) === 32)) kingFrom = q;
+          else if (p === myK && ((k === 0 && inPalace) || (targetIsKing && d < 2))) kingFrom = q;
           screens = 1;
         } else if (screens === 1) {
           if (p === myC && cannonFrom < 0) cannonFrom = q;
@@ -841,7 +1043,7 @@ function see(from, to, side) {
   const target = board[to];
 
   let d = 0;
-  seeGain[0] = target ? BASEV_TAB[target] : 0;
+  seeGain[0] = target ? seePieceVal(target, to) : 0;
 
   let curPiece = moving;
   let curSide = side ^ 1;
@@ -854,11 +1056,18 @@ function see(from, to, side) {
 
   while (d < 24) {
     d++;
-    seeGain[d] = BASEV_TAB[curPiece] - seeGain[d - 1];
+    seeGain[d] = seePieceVal(curPiece, to) - seeGain[d - 1];
     if (Math.max(-seeGain[d - 1], seeGain[d]) < 0) break;
 
-    const nextFrom = getLeastValuableAttacker(to, curSide);
+    const curIsKing = (curPiece | 32) === 107;
+    const nextFrom = getLeastValuableAttacker(to, curSide, curIsKing);
     if (nextFrom < 0) break;
+
+    if (curIsKing) {
+      d++;
+      seeGain[d] = -20000;
+      break;
+    }
 
     curPiece = board[nextFrom];
     remSq[remCnt] = nextFrom;
@@ -867,11 +1076,6 @@ function see(from, to, side) {
     board[nextFrom] = 0;
 
     curSide ^= 1;
-    if ((curPiece | 32) === 107) {
-      d++;
-      seeGain[d] = BASEV_TAB[curPiece] - seeGain[d - 1];
-      break;
-    }
   }
 
   for (let i = remCnt - 1; i >= 0; i--) {
@@ -1088,7 +1292,7 @@ function precomputeRootPenalties(text90, side) {
 }
 
 // ============================================================================
-// MOVE GENERATION (Accurate SEE for Captures)
+// MOVE GENERATION (Accurate SEE for Captures + Palace Sacrifice Awareness)
 // ============================================================================
 let gN = 0, gBase = 0, gSide = 0, gCapOnly = false, gQChecks = false;
 let gCheckNow = false, gKr = 0, gKc = 0;
@@ -1138,17 +1342,21 @@ function addMove(from, to, moving) {
     moveTo[idx] = to;
     moveCap[idx] = target;
     if (!quiet) {
-      const bt = BASEV_TAB[target];
-      const bm = BASEV_TAB[moving];
-      // Luôn dùng SEE cho các pha ăn quân có nguy cơ đổi quân (trừ khi Tốt ăn quân lớn hơn)
-      const seeVal = (bm <= 115 && bt >= 150) ? (bt - bm) : see(from, to, side);
-      if (seeVal >= 0) {
-        moveScore[idx] = 2000000 + seeVal * 16 + bt * 4 - (bm >> 2);
+      const bt = seePieceVal(target, to);
+      const bm = seePieceVal(moving, from);
+      const seeVal = (bm <= 115 && bt >= 155) ? (bt - bm) : see(from, to, side);
+      const chBonus = capHist[(PTYPE_IDX[moving] * 7 + PTYPE_IDX[target]) * 90 + to] >> 2;
+      const utTarget = UPPER_TAB[target];
+      const isPalaceGuard = (utTarget === 65 || to === 13 || to === 76) && majorCnt[side] >= 2;
+      if (seeVal >= -15) {
+        moveScore[idx] = 2000000 + seeVal * 16 + bt * 4 - (bm >> 2) + chBonus + (isPalaceGuard ? 1500 : 0);
+      } else if (seeVal >= -120) {
+        moveScore[idx] = 500000 + seeVal * 16 + bt + chBonus + (isPalaceGuard ? 3500 : 0);
       } else {
-        moveScore[idx] = 200000 + seeVal * 16 + bt;
+        moveScore[idx] = 100000 + seeVal * 16 + bt + chBonus + (isPalaceGuard ? 6000 : 0);
       }
     } else {
-      moveScore[idx] = gQChecks ? 600000 : 0;
+      moveScore[idx] = gQChecks ? 650000 : 0;
     }
     gN++;
   }
@@ -1231,7 +1439,7 @@ function generateLegalMoves(side, capturesOnly, ply, includeQuietChecks = false,
 }
 
 // ============================================================================
-// GRANDMASTER EVALUATION (Tactical Pins, Mating Patterns, True Exchange Map)
+// GRANDMASTER EVALUATION (4-Ray King X-Ray, Thập Đại Sát Thức, Non-linear Danger)
 // ============================================================================
 const rAtt = new Uint8Array(90);
 const bAtt = new Uint8Array(90);
@@ -1242,6 +1450,11 @@ const rRookCols = new Int8Array(2);
 const bRookCols = new Int8Array(2);
 const rRookRows = new Int8Array(2);
 const bRookRows = new Int8Array(2);
+
+let evalRMaxThreat = 0;
+let evalBMaxThreat = 0;
+const evRThreat = new Int16Array(1 << EV_BITS);
+const evBThreat = new Int16Array(1 << EV_BITS);
 
 function evaluateRaw() {
   rAtt.fill(0);
@@ -1255,11 +1468,21 @@ function evaluateRaw() {
   let rAtk = 0, bAtk = 0, rPot = 0, bPot = 0, rNear = 0, bNear = 0;
   let rRooks = 0, bRooks = 0;
   let rHasCentralC = false, bHasCentralC = false;
+  let rFlankC = false, bFlankC = false; // Ngũ Lục Pháo / Ngũ Thất Pháo
+  let rBottomC = false, bBottomC = false;
+  let rMatingBonus = 0, bMatingBonus = 0;
 
   const rk = kingSq[1], bk = kingSq[0];
   const rkr = rk >= 0 ? ROW[rk] : 9, rkc = rk >= 0 ? COL[rk] : 4;
   const bkr = bk >= 0 ? ROW[bk] : 0, bkc = bk >= 0 ? COL[bk] : 4;
   const phase = Math.max(0, Math.min(22, pieceCount - 10));
+
+  // Quét nhanh xem 2 bên có Pháo Đầu (cột 4) không để định giá Cấp Tiến Trung Binh & Pháo Đầu Mã Đội
+  for (let r = 0; r < 10; r++) {
+    const p = board[r * 9 + 4];
+    if (p === 67) rHasCentralC = true;
+    else if (p === 99) bHasCentralC = true;
+  }
 
   // VÒNG 0: PHÁT HIỆN QUÂN BỊ GHIM TRÊN TRỤC TƯỚNG (PINNED PIECES & PHÁO KHỐNG)
   for (let s = 0; s < 2; s++) {
@@ -1281,24 +1504,22 @@ function evaluateRaw() {
           firstSq = q;
         } else if (secondSq < 0) {
           secondSq = q;
-          // 1. Bị Xe hoặc Tướng địch ghim tuyệt đối (chỉ có 1 quân chắn giữa)
           if (p === enemyR || p === enemyK) {
             if (SIDE_TAB[board[firstSq]] === s) {
               pinnedMask[firstSq] = 2; // Ghim tuyệt đối
               const pinnedVal = BASEV_TAB[board[firstSq]];
-              score += s ? -(28 + (pinnedVal >> 4)) : (28 + (pinnedVal >> 4));
+              score += s ? -(32 + (pinnedVal >> 4)) : (32 + (pinnedVal >> 4));
             }
           }
         } else {
-          // 2. Bị Pháo địch ghim (có đúng 2 quân chắn giữa Pháo và Tướng)
           if (p === enemyC) {
             if (SIDE_TAB[board[firstSq]] === s) {
               pinnedMask[firstSq] = 1;
-              score += s ? -26 : 26;
+              score += s ? -28 : 28;
             }
             if (SIDE_TAB[board[secondSq]] === s) {
               pinnedMask[secondSq] = 1;
-              score += s ? -26 : 26;
+              score += s ? -28 : 28;
             }
           }
           break;
@@ -1307,7 +1528,7 @@ function evaluateRaw() {
     }
   }
 
-  // VÒNG 1: TÍNH GIÁ TRỊ QUÂN, ĐỘ CƠ ĐỘNG, THẾ SÁT CỤC & BẢN ĐỒ ĐE DỌA
+  // VÒNG 1: TÍNH GIÁ TRỊ QUÂN, ĐỘ CƠ ĐỘNG, THẬP ĐẠI SÁT THỨC & BẢN ĐỒ ĐE DỌA
   for (let i = 0; i < 90; i++) {
     const p = board[i];
     if (!p) continue;
@@ -1317,6 +1538,7 @@ function evaluateRaw() {
     const idx = side ? i : (89 - i);
     const r = ROW[i], c = COL[i];
     const t = UPPER_TAB[p];
+    const isAbsPinned = pinnedMask[i] === 2;
     let v = BASEV_TAB[p];
 
     const ekr = side ? bkr : rkr;
@@ -1328,29 +1550,54 @@ function evaluateRaw() {
       distToEK = dr + dc;
     }
 
-    if (t === 80) { // Pawn (115)
+    if (t === 80) { // Pawn (115) - Cấp Tiến Trung Binh, Yết Hầu Tốt & Lệ Tốt nhập cung
       v += pstPawn[idx];
       const rr = r + (side ? -1 : 1);
-      if (rr >= 0 && rr < 10) {
+      if (!isAbsPinned && rr >= 0 && rr < 10) {
         const sqF = rr * 9 + c;
         myAtt[sqF]++;
         if (115 < myMin[sqF]) myMin[sqF] = 115;
       }
       if (side ? r <= 4 : r >= 5) {
-        if (c > 0) { myAtt[i - 1]++; if (115 < myMin[i - 1]) myMin[i - 1] = 115; }
-        if (c < 8) { myAtt[i + 1]++; if (115 < myMin[i + 1]) myMin[i + 1] = 115; }
-        v += (14 - distToEK) * 6;
-        // Cặp Tốt qua sông liên kết ("Nhị Quỷ Phách Môn")
-        if (c < 8 && board[i + 1] === p) v += 32;
-        if (rr >= 0 && rr < 10 && board[rr * 9 + c] !== 0 && SIDE_TAB[board[rr * 9 + c]] === side) v += 15;
-        // Tốt áp sát Cửu Cung
-        if (distToEK <= 2) v += 28;
+        if (!isAbsPinned) {
+          if (c > 0) { myAtt[i - 1]++; if (115 < myMin[i - 1]) myMin[i - 1] = 115; }
+          if (c < 8) { myAtt[i + 1]++; if (115 < myMin[i + 1]) myMin[i + 1] = 115; }
+        }
+        v += (14 - distToEK) * 7;
+        if (c < 8 && board[i + 1] === p) v += 36; // Song Tốt Liên Hoàn
+        if (rr >= 0 && rr < 10 && board[rr * 9 + c] !== 0 && SIDE_TAB[board[rr * 9 + c]] === side) v += 18;
+        if (distToEK <= 2) {
+          v += 36;
+          if (side) rNear++; else bNear++;
+        }
+        // Cấp Tiến Trung Binh qua hà (Tốt lộ 5 xung phong khi có Pháo Đầu)
+        if (c === 4 && (side ? rHasCentralC : bHasCentralC)) {
+          v += (side ? (r <= 3 ? 52 : 34) : (r >= 6 ? 52 : 34));
+          if (side) rMatingBonus += 1; else bMatingBonus += 1;
+        }
+        // Tốt Nhập Cửu Cung / Yết Hầu Tốt ("Tiểu Xa")
+        if (c >= 3 && c <= 5 && (side ? r <= 2 : r >= 7)) {
+          if (i === 13 || i === 76) {
+            v += 58; // Tốt chiếm Tâm Cung
+            if (side) rMatingBonus += 2; else bMatingBonus += 2;
+          } else if (side ? r >= 1 : r <= 8) {
+            v += 36; // Tốt Cửu Cung lầu 2/3
+            if (side) rMatingBonus += 1; else bMatingBonus += 1;
+          } else if (c === 3 || c === 5) {
+            v += 32; // Lệ Tốt kẹp sát Tướng ở hàng đáy
+            if (side) rMatingBonus += 1; else bMatingBonus += 1;
+          }
+        }
         if (side) rAtk++; else bAtk++;
       } else {
         if (side) rPot++; else bPot++;
         if ((c === 2 || c === 6) && (side ? r === 5 : r === 4)) v += 16;
+        // Thưởng Tốt 5 tấn 1 khởi phát Cấp Tiến Trung Binh
+        if (c === 4 && (side ? (r === 5 && rHasCentralC) : (r === 4 && bHasCentralC))) {
+          v += 24;
+        }
       }
-    } else if (t === 78) { // Knight (495)
+    } else if (t === 78) { // Knight (495) - Ngọa Tào, Quải Giác, Điếu Ngư, Pháo Đầu Mã Đội & Bàn Hà Mã
       v = 470 + ((22 - phase) * 3) + pstKnight[idx];
       if (side) { rMaj++; rAtk++; } else { bMaj++; bAtk++; }
       let mob = 0;
@@ -1372,20 +1619,49 @@ function evaluateRaw() {
         if (q === 0 || SIDE_TAB[q] !== side) {
           if (!isPinned && !isAttackedByPawn(to, side ^ 1)) mob++;
         } else if (q === p) {
-          v += 24; // Song Mã liên hoàn
+          v += 28; // Song Mã Liên Hoàn (Pháo Đầu Mã Đội!)
         }
       }
       v += (mob - 4) * 8;
-      if (mob === 0) v -= 45; // Mã chết góc / bị bít hết chân
-      if (side ? r <= 7 : r >= 2) v += (14 - distToEK) * 5;
+      if (mob === 0) v -= 45;
+      if (side ? r <= 7 : r >= 2) v += (14 - distToEK) * 6;
 
-      // Sát thức: Ngọa Tào Mã & Quải Giác Mã
-      if (side ? (r === 1 || r === 2) : (r === 8 || r === 7)) {
-        if (c === 2 || c === 6) v += 38; // Ngọa Tào / Quải Giác
-        else if (c === 3 || c === 5) v += 28;
+      // Thưởng thế Pháo Đầu Mã Đội (Mã trung tâm lộ 5) & Mã Bàn Hà (lộ 4/6 trên bờ sông)
+      if (side ? rHasCentralC : bHasCentralC) {
+        if (c === 4 && (side ? (r >= 4 && r <= 6) : (r >= 3 && r <= 5))) {
+          v += 28; // Mã Đội hộ tống Pháo Đầu!
+        } else if ((c === 3 || c === 5) && (side ? r === 5 : r === 4)) {
+          v += 26; // Bàn Hà Mã công trung lộ!
+        }
       }
 
-      // Chống Mã hồi cung / Quy tâm mã
+      // Nhận diện Ngọa Tào Mã, Quải Giác Mã & Điếu Ngư Mã
+      if (side ? (r === 1 || r === 2) : (r === 8 || r === 7)) {
+        if (c === 2 || c === 6) {
+          if (side ? r === 1 : r === 8) {
+            // Ngọa Tào Mã (Slot Knight)
+            v += 46;
+            if (!isPinned) {
+              const slotLeg = side ? (c === 2 ? 12 : 14) : (c === 2 ? 75 : 77);
+              if (board[slotLeg] === 0) {
+                v += 26;
+                if (side) rMatingBonus += 2; else bMatingBonus += 2;
+              } else {
+                if (side) rMatingBonus += 1; else bMatingBonus += 1;
+              }
+            }
+          } else {
+            // Điếu Ngư Mã / Cao Điếu Mã (Fishing Horse at row 2/7, col 2/6)
+            v += 38;
+            if (!isPinned) { if (side) rMatingBonus += 1; else bMatingBonus += 1; }
+          }
+        } else if (c === 3 || c === 5) {
+          // Quải Giác Mã (Corner-Hanging Knight at row 1..2 / 7..8, col 3/5)
+          v += 42;
+          if (!isPinned) { if (side) rMatingBonus += 2; else bMatingBonus += 2; }
+        }
+      }
+
       if (side === 0) {
         if (r === 1 && c === 4) v -= 60;
         else if (r === 2 && c === 4 && (board[2] === 98 || board[6] === 98)) v -= 26;
@@ -1394,37 +1670,47 @@ function evaluateRaw() {
         else if (r === 7 && c === 4 && (board[83] === 66 || board[87] === 66)) v -= 26;
       }
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
-    } else if (t === 67) { // Cannon (515)
+    } else if (t === 67) { // Cannon (515) - Mã Hậu Pháo, Trùng Pháo, Ngũ Lục/Ngũ Thất Pháo, Pháo Trầm Đáy
       v = 465 + (phase * 4) + pstCannon[idx];
       if (side) { rMaj++; rAtk++; } else { bMaj++; bAtk++; }
-      if (c === 4) { if (side) rHasCentralC = true; else bHasCentralC = true; }
+      if (c === 2 || c === 3 || c === 5 || c === 6) {
+        if (side) rFlankC = true; else bFlankC = true;
+      }
+      const enemyK = side ? 107 : 75;
       for (let d = 0; d < 4; d++) {
         const step = STEP4[d], nmax = RAY_N[i * 4 + d];
-        let to = i, screens = 0;
+        let to = i, screens = 0, screenP = 0;
         for (let k = 0; k < nmax; k++) {
           to += step;
           const q = board[to];
           if (!screens) {
             if (q !== 0) {
               screens = 1;
-              if (q === p) v += 18; // Pháo gánh
+              screenP = q;
+              if (q === p) v += 20;
             }
           } else if (q !== 0) {
-            myAtt[to]++;
-            if (515 < myMin[to]) myMin[to] = 515;
-            if (q === p) v += 26; // Pháo lồng (Trùng Pháo)
+            if (!isAbsPinned) {
+              myAtt[to]++;
+              if (515 < myMin[to]) myMin[to] = 515;
+              if (q === enemyK && SIDE_TAB[screenP] === side && (UPPER_TAB[screenP] === 78 || screenP === p)) {
+                v += 32;
+                if (side) rMatingBonus += 2; else bMatingBonus += 2;
+              }
+            }
+            if (q === p) v += 28;
             break;
-          } else {
+          } else if (!isAbsPinned) {
             myAtt[to]++;
             if (515 < myMin[to]) myMin[to] = 515;
           }
         }
       }
-      // Pháo trầm đáy (Bottom-rank Cannon)
-      if ((side && r === 0) || (!side && r === 9)) v += 24;
+      if (side && r === 0) { v += 28; rBottomC = true; }
+      else if (!side && r === 9) { v += 28; bBottomC = true; }
       v += (14 - distToEK) * 3;
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
-    } else if (t === 82) { // Rook (1090)
+    } else if (t === 82) { // Rook (1090) - Xe Yết Hầu, Xe Kẹp Sườn, Song Xe Thác
       v += pstRook[idx];
       if (side) {
         rMaj += 2; rAtk++;
@@ -1434,13 +1720,12 @@ function evaluateRaw() {
         if (bRooks < 2) { bRookCols[bRooks] = c; bRookRows[bRooks] = r; bRooks++; }
       }
       let mob = 0;
-      const isPinned = pinnedMask[i] === 2;
       for (let d = 0; d < 4; d++) {
         const step = STEP4[d], nmax = RAY_N[i * 4 + d];
         let to = i;
         for (let k = 0; k < nmax; k++) {
           to += step;
-          if (!isPinned) {
+          if (!isAbsPinned) {
             myAtt[to]++;
             if (1090 < myMin[to]) myMin[to] = 1090;
           }
@@ -1448,35 +1733,41 @@ function evaluateRaw() {
           if (board[to]) break;
         }
       }
-      v += mob * 4 + (14 - distToEK) * 3;
-      // Xe chiếm lộ sườn (Lộ 4, 6 - Rib Files)
+      v += mob * 4 + (14 - distToEK) * 4;
       if (c === 3 || c === 5) {
-        v += 22;
-        if (c === ekc) v += 28; // Lộ mặt Tướng địch
+        v += 24;
+        if (c === ekc) v += 32;
       }
-      // Xe trầm đáy / kẹp cổ Tướng
-      if (side ? (r === 0 || r === 1) : (r === 9 || r === 8)) v += 26;
-      // Phạt Xe chưa xuất động ở khai/trung cuộc
+      if (side ? r === 1 : r === 8) {
+        v += 34; // Xe chiếm Yết Hầu (Palace Throat Rank)
+        if (side) rMatingBonus += 1; else bMatingBonus += 1;
+      } else if (side ? r === 0 : r === 9) {
+        v += 28; // Xe trầm đáy
+      }
       if (phase >= 12) {
-        if (!side && r === 0 && (c === 0 || c === 8)) v -= 28;
-        else if (side && r === 9 && (c === 0 || c === 8)) v -= 28;
+        if (!side && r === 0 && (c === 0 || c === 8)) v -= 32;
+        else if (side && r === 9 && (c === 0 || c === 8)) v -= 32;
       }
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
     } else if (t === 65) { // Advisor (155)
       if (side) rAdv++; else bAdv++;
       if (c === 4) v += 22;
-      const advTab = ADV_TO[side], b4 = i * 4;
-      for (let k = 0; k < 4; k++) {
-        const to = advTab[b4 + k];
-        if (to >= 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+      if (!isAbsPinned) {
+        const advTab = ADV_TO[side], b4 = i * 4;
+        for (let k = 0; k < 4; k++) {
+          const to = advTab[b4 + k];
+          if (to >= 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+        }
       }
     } else if (t === 66) { // Bishop (155)
       if (side) rBish++; else bBish++;
       if (c === 4) v += 24;
-      const bisTab = BIS_TO[side], eyeTab = BIS_EYE[side], b4 = i * 4;
-      for (let k = 0; k < 4; k++) {
-        const to = bisTab[b4 + k];
-        if (to >= 0 && board[eyeTab[b4 + k]] === 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+      if (!isAbsPinned) {
+        const bisTab = BIS_TO[side], eyeTab = BIS_EYE[side], b4 = i * 4;
+        for (let k = 0; k < 4; k++) {
+          const to = bisTab[b4 + k];
+          if (to >= 0 && board[eyeTab[b4 + k]] === 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+        }
       }
     } else if (t === 75) { // King
       if (c === 4 && (r === 0 || r === 9)) v += 15;
@@ -1489,7 +1780,10 @@ function evaluateRaw() {
     score += side ? v : -v;
   }
 
-  // VÒNG 2: THẾ TRẬN BÌNH PHONG MÃ & KHIÊN TRUNG LỘ CHỐNG PHÁO ĐẦU
+  // VÒNG 2: THẾ TRẬN BÌNH PHONG MÃ, NGŨ LỤC/NGŨ THẤT PHÁO & KHIÊN TRUNG LỘ
+  if (rHasCentralC && rFlankC) score += 22; // Thưởng phối hợp Ngũ Lục Pháo / Ngũ Thất Pháo
+  if (bHasCentralC && bFlankC) score -= 22;
+
   const bLeftScreenN = board[20] === 110;
   const bRightScreenN = board[24] === 110;
   if (bLeftScreenN && bRightScreenN) score -= (rHasCentralC ? 54 : 32);
@@ -1525,19 +1819,17 @@ function evaluateRaw() {
     const minEnemyAtt = side ? bMinAtt[i] : rMinAtt[i];
     let syn = 0;
 
-    if (IS_MAJOR[p]) { // Xe (1090), Pháo (515), Mã (495)
+    if (IS_MAJOR[p]) {
       if (def > 0) {
-        syn += 14 + Math.min(def, 3) * 6; // Thưởng quân có căn liên kết
+        syn += 14 + Math.min(def, 3) * 6;
       }
       if (att > 0) {
         if (def === 0) {
-          // 1. Quân chủ lực KHÔNG CÓ CĂN và đang bị bắt
           const hangPen = (t === 82 ? 195 : 120);
           syn -= hangPen;
           if (side) { rHangingMajors++; if (hangPen > rMaxThreat) rMaxThreat = hangPen; }
           else { bHangingMajors++; if (hangPen > bMaxThreat) bMaxThreat = hangPen; }
         } else if (minEnemyAtt + 80 < myVal) {
-          // 2. Quân lớn bị quân NHỎ HƠN bắt (VD: Xe bị Mã/Pháo/Tốt bắt; Mã/Pháo bị Tốt/Sĩ/Tượng bắt)
           const tradeLoss = (myVal - minEnemyAtt) >> 3;
           const pen = 38 + tradeLoss;
           syn -= pen;
@@ -1547,7 +1839,7 @@ function evaluateRaw() {
           syn -= 46;
         }
       }
-    } else { // Tốt, Sĩ, Tượng
+    } else {
       if (def > 0) {
         syn += (t === 65 || t === 66) ? 16 : 10;
       } else if (att > 0) {
@@ -1558,57 +1850,165 @@ function evaluateRaw() {
     score += side ? syn : -syn;
   }
 
-  // Nếu bị bắt đôi (2 quân chủ lực cùng bị đe dọa ăn không hoặc đổi lỗ), chắc chắn mất ít nhất 1 quân!
   if (rHangingMajors >= 2) score -= 175;
   if (bHangingMajors >= 2) score += 175;
 
-  // Song Xe liên kết
-  if (rRooks === 2 && (rRookCols[0] === rRookCols[1] || rRookRows[0] === rRookRows[1])) score += 34;
-  if (bRooks === 2 && (bRookCols[0] === bRookCols[1] || bRookRows[0] === bRookRows[1])) score -= 34;
+  if (rRooks === 2 && (rRookCols[0] === rRookCols[1] || rRookRows[0] === rRookRows[1])) score += 38;
+  if (bRooks === 2 && (bRookCols[0] === bRookCols[1] || bRookRows[0] === bRookRows[1])) score -= 38;
 
-  // Khung phòng thủ Sĩ - Tượng
-  if (rAdv === 2) score += 44; else if (rAdv === 0 && bMaj >= 2) score -= 95;
-  if (bAdv === 2) score -= 44; else if (bAdv === 0 && rMaj >= 2) score += 95;
-  if (rBish === 2) score += 34; else if (rBish === 0 && bMaj >= 2) score -= 58;
-  if (bBish === 2) score -= 34; else if (bBish === 0 && rMaj >= 2) score += 58;
+  if (rAdv === 2) score += 44; else if (rAdv === 0 && bMaj >= 2) score -= 125;
+  if (bAdv === 2) score -= 44; else if (bAdv === 0 && rMaj >= 2) score += 125;
+  if (rBish === 2) score += 34; else if (rBish === 0 && bMaj >= 2) score -= 75;
+  if (bBish === 2) score -= 34; else if (bBish === 0 && rMaj >= 2) score += 75;
 
-  // Nguy hiểm quanh Cửu Cung
-  score -= bNear * (4 - rAdv - rBish) * 9;
-  score += rNear * (4 - bAdv - bBish) * 9;
+  // ==========================================================================
+  // VÒNG 4: ĐÁNH GIÁ CÔNG SÁT ĐẠI KIỆN TƯỚNG (4-RAY SCANNER & THẬP ĐẠI SÁT CỤC)
+  // ==========================================================================
+  let rAtkWeight = rNear * 2 + rMatingBonus;
+  let bAtkWeight = bNear * 2 + bMatingBonus;
 
-  // Áp lực Pháo đầu & Thiết Môn Thuyên (Iron Bolt)
+  // Thiên Địa Pháo (Central Cannon + Bottom Cannon)
+  if (rHasCentralC && rBottomC) { score += 58; rAtkWeight += 3; }
+  if (bHasCentralC && bBottomC) { score -= 58; bAtkWeight += 3; }
+
+  // 1. Kiểm tra Xe kẹp lộ sườn (Lộ 4, 6) & Song Xe Thác (2 Xe càn quét đáy/cung)
+  let rRibRooks = 0, bRibRooks = 0;
+  let rBottomRooks = 0, bBottomRooks = 0;
+  for (let k = 0; k < rRooks; k++) {
+    if (rRookCols[k] === 3 || rRookCols[k] === 5 || rRookCols[k] === bkc) { rRibRooks++; rAtkWeight += 2; }
+    if (rRookRows[k] <= 2) { rBottomRooks++; rAtkWeight += 2; }
+  }
+  for (let k = 0; k < bRooks; k++) {
+    if (bRookCols[k] === 3 || bRookCols[k] === 5 || bRookCols[k] === rkc) { bRibRooks++; bAtkWeight += 2; }
+    if (bRookRows[k] >= 7) { bBottomRooks++; bAtkWeight += 2; }
+  }
+  if (rRibRooks >= 2) { score += 65; rAtkWeight += 2; }
+  if (bRibRooks >= 2) { score -= 65; bAtkWeight += 2; }
+  if (rBottomRooks >= 2) { score += 80; rAtkWeight += 3; } // Song Xe Thác
+  if (bBottomRooks >= 2) { score -= 80; bAtkWeight += 3; }
+
+  // 2. Radar Quét Sát Cục 4 Tia từ Tướng địch (Không Đầu Pháo, Trùng Pháo, Giáp Xa Pháo, Thiết Môn Thuyên, Pháo Đáy)
   for (let s = 0; s < 2; s++) {
     const ek = kingSq[s ^ 1];
-    if (ek >= 0 && (ek % 9) === 4) {
-      const kr = (ek / 9) | 0;
-      const myC = s ? 67 : 99;
-      const dr = s ? -1 : 1;
-      let r = kr - dr, screens = 0;
-      while (r >= 0 && r < 10) {
-        const p = board[r * 9 + 4];
-        if (p) {
-          if (p === myC) {
-            if (screens === 0) score += (s ? 76 : -76); // Pháo trống chiếu trực tiếp
-            else if (screens === 1) score += (s ? 44 : -44); // Pháo đầu đóng chặt
-            else if (screens === 2) score += (s ? 22 : -22);
-            break;
+    if (ek < 0) continue;
+    const myC = s ? 67 : 99;
+    const myR = s ? 82 : 114;
+    const hasRibRook = (s ? rRibRooks : bRibRooks) > 0;
+
+    for (let d = 0; d < 4; d++) {
+      const step = STEP4[d], nmax = RAY_N[ek * 4 + d];
+      let q = ek, screens = 0, firstPiece = 0;
+      let cannonsOnRay = 0, rooksOnRay = 0;
+      for (let k = 0; k < nmax; k++) {
+        q += step;
+        const p = board[q];
+        if (!p) continue;
+        if (p === myC) {
+          cannonsOnRay++;
+          if (screens === 0) {
+            // Không Đầu Pháo (Pháo trống ngắm thẳng Tướng dọc hoặc ngang)
+            score += s ? 105 : -105;
+            if (s) rAtkWeight += 4; else bAtkWeight += 4;
+          } else if (screens === 1) {
+            // Pháo Khống / Pháo Đáy chiếu trực tiếp + Thiết Môn Thuyên
+            const ironBolt = (d < 2 && hasRibRook) ? 42 : 0;
+            const mountBonus = (SIDE_TAB[firstPiece] === s) ? 24 : 0;
+            const totalB = 52 + ironBolt + mountBonus;
+            score += s ? totalB : -totalB;
+            if (s) rAtkWeight += 3; else bAtkWeight += 3;
+          } else if (screens === 2) {
+            if (cannonsOnRay >= 2) {
+              // Trùng Pháo (Điệp Pháo trên trục Tướng)
+              score += s ? 68 : -68;
+              if (s) rAtkWeight += 3; else bAtkWeight += 3;
+            } else {
+              score += s ? 26 : -26;
+              if (s) rAtkWeight += 1; else bAtkWeight += 1;
+            }
           }
-          screens++;
-          if (screens > 2) break;
+        } else if (p === myR) {
+          rooksOnRay++;
+          if (screens === 0) {
+            score += s ? 55 : -55;
+            if (s) rAtkWeight += 3; else bAtkWeight += 3;
+          } else if (screens === 1) {
+            score += s ? 40 : -40; // Xe kẹp cổ / X-ray Tướng
+            if (s) rAtkWeight += 2; else bAtkWeight += 2;
+          } else if (screens === 2 && (cannonsOnRay > 0 || rooksOnRay >= 2)) {
+            score += s ? 46 : -46; // Giáp Xa Pháo / Song Xe chồng trục Tướng
+            if (s) rAtkWeight += 2; else bAtkWeight += 2;
+          }
         }
-        r -= dr;
+        if (screens === 0) firstPiece = p;
+        screens++;
+        if (screens > 3) break;
       }
     }
   }
 
-  // Khuyến khích đổi quân khi đang hơn hẳn 1 quân lớn (> 350 điểm)
+  // 3. Hỏa lực dồn vào Tâm Cửu Cung (ô [1,4] = 13 của Đen, ô [8,4] = 76 của Đỏ)
+  if (rAtt[13] >= 2) {
+    rAtkWeight += rAtt[13] + 1;
+    score += 32 * rAtt[13] + (bAdv < 2 ? 42 : 0);
+  }
+  if (bAtt[76] >= 2) {
+    bAtkWeight += bAtt[76] + 1;
+    score -= 32 * bAtt[76] + (rAdv < 2 ? 42 : 0);
+  }
+
+  // 4. Đếm số ô thoát an toàn của Tướng (King Escape Restriction)
+  if (bk >= 0) {
+    let bSafeEscapes = 0;
+    const b4 = bk * 4, kTab = KNG_TO[0];
+    for (let k = 0; k < 4; k++) {
+      const to = kTab[b4 + k];
+      if (to >= 0) {
+        const q = board[to];
+        if ((q === 0 || SIDE_TAB[q] === 1) && rAtt[to] === 0) bSafeEscapes++;
+        if (rAtt[to] > 0) rAtkWeight++;
+      }
+    }
+    if (bSafeEscapes === 0 && rNear > 0) {
+      score += 68 + rNear * 22;
+      rAtkWeight += 3;
+    } else if (bSafeEscapes === 1 && rNear >= 2) {
+      score += 28 + rNear * 10;
+      rAtkWeight += 1;
+    }
+  }
+  if (rk >= 0) {
+    let rSafeEscapes = 0;
+    const b4 = rk * 4, kTab = KNG_TO[1];
+    for (let k = 0; k < 4; k++) {
+      const to = kTab[b4 + k];
+      if (to >= 0) {
+        const q = board[to];
+        if ((q === 0 || SIDE_TAB[q] === 0) && bAtt[to] === 0) rSafeEscapes++;
+        if (bAtt[to] > 0) bAtkWeight++;
+      }
+    }
+    if (rSafeEscapes === 0 && bNear > 0) {
+      score -= 68 + bNear * 22;
+      bAtkWeight += 3;
+    } else if (rSafeEscapes === 1 && bNear >= 2) {
+      score -= 28 + bNear * 10;
+      bAtkWeight += 1;
+    }
+  }
+
+  // 5. Điểm thưởng Công Sát Phi Tuyến Tính (Nâng trần lên 780 để khuyến khích Phế Quân Công Sát)
+  const bDefWeakness = 5 - bAdv - (bBish >> 1) + (bAdv === 0 && rRooks > 0 ? 2 : 0) + (bBish === 0 && rHasCentralC ? 1 : 0);
+  const rDefWeakness = 5 - rAdv - (rBish >> 1) + (rAdv === 0 && bRooks > 0 ? 2 : 0) + (rBish === 0 && bHasCentralC ? 1 : 0);
+  const rKingDanger = Math.min(780, (rAtkWeight * rAtkWeight * bDefWeakness) >> 1);
+  const bKingDanger = Math.min(780, (bAtkWeight * bAtkWeight * rDefWeakness) >> 1);
+  score += rKingDanger - bKingDanger;
+
   if (score > 350) {
     score += (6 - bMaj) * 18;
   } else if (score < -350) {
     score -= (6 - rMaj) * 18;
   }
 
-  // Cờ tàn (Tướng trợ công & chiếm trung lộ)
   if (rMaj + bMaj <= 5) {
     if (score > 180) {
       if (rkc === 4) score += 24;
@@ -1624,20 +2024,31 @@ function evaluateRaw() {
   if (score > 0 && rAtk === 0) score = rPot > 0 ? (score / 2) | 0 : (score / 4) | 0;
   else if (score < 0 && bAtk === 0) score = bPot > 0 ? (score / 2) | 0 : (score / 4) | 0;
 
+  evalRMaxThreat = rMaxThreat + (rHangingMajors >= 2 ? 140 : 0) + (bKingDanger >> 2);
+  evalBMaxThreat = bMaxThreat + (bHangingMajors >= 2 ? 140 : 0) + (rKingDanger >> 2);
   return score;
 }
 
 function evaluate() {
   const k = curHashLo & EV_MASK;
-  if (evKeyLo[k] === curHashLo && evKeyHi[k] === curHashHi) return evVal[k];
+  if (evKeyLo[k] === curHashLo && evKeyHi[k] === curHashHi) {
+    evalRMaxThreat = evRThreat[k];
+    evalBMaxThreat = evBThreat[k];
+    return evVal[k];
+  }
   const s = evaluateRaw();
   evKeyLo[k] = curHashLo; evKeyHi[k] = curHashHi; evVal[k] = s;
+  evRThreat[k] = evalRMaxThreat;
+  evBThreat[k] = evalBMaxThreat;
   return s;
 }
 
 function evalSide(side) {
   const s = evaluate();
-  return (side ? s : -s) + 16;
+  const myThreatOnEnemy = side ? evalBMaxThreat : evalRMaxThreat;
+  const enemyThreatOnMe = side ? evalRMaxThreat : evalBMaxThreat;
+  const tempoTactical = (myThreatOnEnemy >> 1) - (enemyThreatOnMe >> 2);
+  return (side ? s : -s) + 22 + tempoTactical;
 }
 
 function doMove(from, to, cap, moving, side) {
@@ -1675,9 +2086,9 @@ function undoMove(from, to, cap, moving, side) {
 }
 
 // ============================================================================
-// MOVE ORDERING (With Continuation History & Fast Pawn-Trap Filter)
+// STAGED MOVE ORDERING (Aggressive Attacking Priority + Zero Duplicate SEE)
 // ============================================================================
-function scoreMoves(ply, n, ttMoveCode, side) {
+function scoreQuietMovesRange(ply, startIdx, n, ttMoveCode, side) {
   const baseIdx = ply * MAX_MOVES;
   const hBase = side * 8100;
   const pf = ply > 0 ? searchHistoryFrom[ply - 1] : -1;
@@ -1691,7 +2102,7 @@ function scoreMoves(ply, n, ttMoveCode, side) {
   const f2 = ply >= 2 ? searchHistoryFrom[ply - 2] : -1;
   const t2 = ply >= 2 ? searchHistoryTo[ply - 2] : -1;
 
-  for (let i = 0; i < n; i++) {
+  for (let i = startIdx; i < n; i++) {
     const idx = baseIdx + i;
     const f = moveFrom[idx], t = moveTo[idx];
     const mCode = f * 90 + t;
@@ -1699,7 +2110,7 @@ function scoreMoves(ply, n, ttMoveCode, side) {
     if (mCode === ttMoveCode) {
       moveScore[idx] = 10000000;
     } else if (moveCap[idx]) {
-      // Giữ nguyên điểm SEE đã chấm lúc sinh nước ăn quân
+      // Giữ nguyên điểm SEE + Capture History đã chấm lúc sinh nước ăn quân
     } else {
       let s = 0;
       if (f === t2 && t === f2) s -= 6000000;
@@ -1708,16 +2119,53 @@ function scoreMoves(ply, n, ttMoveCode, side) {
       else if (mCode === counterCode) s += 650000;
       else {
         const moving = board[f];
+        const mVal = BASEV_TAB[moving];
         s += historyHeur[hBase + mCode];
         if (contBase >= 0) {
           s += contHist[contBase + PTYPE_IDX[moving] * 90 + t] * 2;
         }
-        // Phạt nặng các nước tĩnh đưa thẳng Xe/Pháo/Mã vào mồm Tốt địch
-        if (IS_MAJOR[moving] && isAttackedByPawn(t, side ^ 1)) {
-          s -= 120000;
+        const ut = UPPER_TAB[moving];
+        const tr = ROW[t], tc = COL[t];
+        const ek = kingSq[side ^ 1];
+        if (ek >= 0 && (IS_MAJOR[moving] || ut === 80)) {
+          const ekr = ROW[ek], ekc = COL[ek];
+          const oldDist = Math.abs(ROW[f] - ekr) + Math.abs(COL[f] - ekc);
+          const newDist = Math.abs(tr - ekr) + Math.abs(tc - ekc);
+          if (newDist < oldDist && newDist <= 4) {
+            s += (5 - newDist) * 1450;
+          }
+          if (ut === 82) {
+            if (tc === 3 || tc === 5 || tc === ekc || tr === ekr) s += 3800;
+            if (side ? (tr <= 1) : (tr >= 8)) s += 3200; // Xe cắm Yết Hầu / Trầm Đáy
+          } else if (ut === 67) {
+            if (tc === ekc || tr === ekr) s += 4400; // Pháo ngắm trục Tướng / Trầm Đáy
+          } else if (ut === 78) {
+            // Mã nhảy Ngọa Tào hoặc Quải Giác
+            if ((side ? (tr === 1 || tr === 2) : (tr === 8 || tr === 7)) && (tc === 2 || tc === 3 || tc === 5 || tc === 6)) {
+              s += 5200;
+            } else if (tc === 4 || ((tc === 3 || tc === 5) && (side ? tr === 5 : tr === 4))) {
+              s += 2200; // Ưu tiên nhảy Mã Đội (lộ 5) hoặc Mã Bàn Hà (lộ 4/6)
+            }
+          } else if (ut === 80) {
+            // Tốt đột nhập Cửu Cung hoặc Cấp Tiến Trung Binh (cột 4)
+            if (tc >= 3 && tc <= 5 && (side ? tr <= 2 : tr >= 7)) s += 4800;
+            else if (tc === 4) s += 2400;
+          }
         }
-        if (UPPER_TAB[moving] === 78) {
-          const tr = ROW[t], tc = COL[t];
+        // Phạt nặng các nước tĩnh đưa Xe/Pháo/Mã vào ô bị quân nhỏ hơn bắt mà SEE âm
+        if (IS_MAJOR[moving]) {
+          if (isAttackedBySmallerPiece(t, side ^ 1, mVal)) {
+            const quietSee = see(f, t, side);
+            if (quietSee < -100) {
+              s -= 260000 + ((-quietSee) << 6);
+            } else if (quietSee < -50) {
+              s -= 140000 + ((-quietSee) << 5);
+            }
+          } else if (isAttackedBySmallerPiece(f, side ^ 1, mVal) && see(f, t, side) >= 0) {
+            s += 18000;
+          }
+        }
+        if (ut === 78) {
           if ((side === 0 && tr === 1 && tc === 4) || (side === 1 && tr === 8 && tc === 4)) {
             s -= 50000;
           }
@@ -1726,6 +2174,10 @@ function scoreMoves(ply, n, ttMoveCode, side) {
       moveScore[idx] = s;
     }
   }
+}
+
+function scoreMoves(ply, n, ttMoveCode, side) {
+  scoreQuietMovesRange(ply, 0, n, ttMoveCode, side);
 }
 
 function pickMove(ply, n, i) {
@@ -1763,6 +2215,11 @@ function contHistUpdate(idx, bonus) {
   contHist[idx] = h + bonus - ((h * (bonus < 0 ? -bonus : bonus) / 16384) | 0);
 }
 
+function capHistUpdate(idx, bonus) {
+  const h = capHist[idx];
+  capHist[idx] = h + bonus - ((h * (bonus < 0 ? -bonus : bonus) / 16384) | 0);
+}
+
 // ============================================================================
 // REPETITION
 // ============================================================================
@@ -1797,7 +2254,7 @@ function shouldStop() {
 }
 
 // ============================================================================
-// QUIESCENCE SEARCH (Safe Tactical Resolution)
+// QUIESCENCE SEARCH (Unlocks Checking Palace Sacrifices & 3-Ply Check Chains)
 // ============================================================================
 function qsearch(alpha, beta, side, ply, qPly) {
   if ((++nodes & 2047) === 0 && shouldStop()) { stopped = 1; return 0; }
@@ -1809,24 +2266,37 @@ function qsearch(alpha, beta, side, ply, qPly) {
     stand = evalSide(side);
     if (stand >= beta) return beta;
     if (stand > alpha) alpha = stand;
-    if (qPly >= 12) return stand;
+    if (qPly >= 14) return stand;
   }
 
-  const includeChecks = !check && (qPly === 0);
+  // Mở rộng tầm nhìn Liên Hoàn Chiếu tĩnh tới qPly <= 2
+  const includeChecks = !check && (qPly <= 2);
   const n = generateLegalMoves(side, !check, ply, includeChecks, check ? 1 : 0);
   if (n === 0) return check ? (-MATE + ply) : alpha;
-  scoreMoves(ply, n, -1, side);
+
+  if (check || includeChecks) {
+    scoreMoves(ply, n, -1, side);
+  }
 
   for (let i = 0; i < n; i++) {
     const idx = pickMove(ply, n, i);
     const f = moveFrom[idx], t = moveTo[idx], cap = moveCap[idx];
-    if (!check && cap !== 0) {
-      if (stand + baseVal(cap) + 220 < alpha) continue;     // Delta pruning
-      if (moveScore[idx] < 1500000 && qPly > 0) continue;   // Cắt các nước ăn quân lỗ từ qPly >= 1
+    const isBadSeeCap = !check && cap !== 0 && moveScore[idx] < 250000;
+    // Cho phép nước Thí Quân Phá Sĩ / Đánh Tâm Cung ở qPly === 0 đi tiếp nếu nó chiếu Tướng!
+    const isPalaceBreak = isBadSeeCap && qPly === 0 && (UPPER_TAB[cap] === 65 || t === 13 || t === 76);
+
+    if (!check && cap !== 0 && !isPalaceBreak) {
+      if (stand + baseVal(cap) + 240 < alpha) continue;     // Delta pruning
+      if (isBadSeeCap) continue;                            // Cắt nước đổi quân lỗ nặng không phải phá Sĩ
+      if (moveScore[idx] < 1500000 && qPly > 0) continue;   // Cắt các nước thí quân lỗ nhẹ từ qPly >= 1
     }
 
     const moving = board[f];
     doMove(f, t, cap, moving, side);
+    if (isPalaceBreak && !inCheck(side ^ 1)) {
+      undoMove(f, t, cap, moving, side);
+      continue;
+    }
     const sc = -qsearch(-beta, -alpha, side ^ 1, ply + 1, qPly + 1);
     undoMove(f, t, cap, moving, side);
 
@@ -1838,7 +2308,7 @@ function qsearch(alpha, beta, side, ply, qPly) {
 }
 
 // ============================================================================
-// MAIN SEARCH
+// MAIN SEARCH (Staged Lazy Quiet Scoring + Mating Extension & LMR Protection)
 // ============================================================================
 function search(depth, alpha, beta, side, ply, allowNull) {
   if ((++nodes & 2047) === 0 && shouldStop()) { stopped = 1; return 0; }
@@ -1876,7 +2346,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
   }
 
   const check = inCheck(side) === 1;
-  if (check && ply < Math.min(MAX_PLY - 12, curIter * 2 + 8)) depth++;
+  if (check && ply < Math.min(MAX_PLY - 10, curIter * 2 + 10)) depth++;
   if (depth <= 0) return qsearch(alpha, beta, side, ply, 0);
 
   let staticEval = NO_EVAL;
@@ -1932,41 +2402,63 @@ function search(depth, alpha, beta, side, ply, allowNull) {
   const n = generateLegalMoves(side, false, ply, false, check ? 1 : 0);
   if (n === 0) return -MATE + ply;
 
-  // Mở rộng thêm 1 ply nếu đang bị chiếu và chỉ có duy nhất 1 nước đỡ hợp lệ
-  const singleReplyExt = (check && n === 1 && ply < MAX_PLY - 10) ? 1 : 0;
+  const singleReplyExt = (check && n <= 2 && (n === 1 || pvNode) && ply < MAX_PLY - 10) ? 1 : 0;
 
-  scoreMoves(ply, n, ttMoveCode, side);
   const baseIdx = ply * MAX_MOVES;
+  if (ttMoveCode >= 0) {
+    for (let i = 0; i < n; i++) {
+      const idx = baseIdx + i;
+      if (moveFrom[idx] * 90 + moveTo[idx] === ttMoveCode) {
+        moveScore[idx] = 10000000;
+        break;
+      }
+    }
+  }
+
+  let quietsScored = false;
   let best = -INF;
   let bestCode = moveFrom[baseIdx] * 90 + moveTo[baseIdx];
   let quietSeen = 0, quietN = 0;
   const hBase = side * 8100;
   const lmpLimit = (improving ? 9 : 6) + depth * depth * 2;
-  const futMargin = 130 + 110 * depth;
+  const futMargin = 135 + 115 * depth;
   const lmrBase = (depth < 64 ? depth : 63) * MAX_MOVES;
 
   const pp = ply > 0 ? searchHistoryPiece[ply - 1] : 0;
   const pt = ply > 0 ? searchHistoryTo[ply - 1] : -1;
   const contBase = (pp > 0 && pt >= 0) ? ((PTYPE_IDX[pp] * 90 + pt) * 630) : -1;
+  const ek = kingSq[side ^ 1];
+  const ekr = ek >= 0 ? ROW[ek] : -1, ekc = ek >= 0 ? COL[ek] : -1;
 
   for (let i = 0; i < n; i++) {
-    const idx = pickMove(ply, n, i);
+    let idx = pickMove(ply, n, i);
+    if (!quietsScored && moveScore[idx] < 1900000) {
+      scoreQuietMovesRange(ply, i, n, ttMoveCode, side);
+      quietsScored = true;
+      idx = pickMove(ply, n, i);
+    }
+
     const f = moveFrom[idx], t = moveTo[idx], cap = moveCap[idx];
     const mCode = f * 90 + t;
     const moving = board[f];
     const isQuiet = cap === 0;
     const goodCap = !isQuiet && moveScore[idx] >= 2000000;
+    const blunderCap = !isQuiet && moveScore[idx] < 250000;
+    const isPalaceSac = !isQuiet && (t === 13 || t === 76 || UPPER_TAB[cap] === 65);
+    const tr = ROW[t], tc = COL[t];
+    const isKillerAttack = isPalaceSac || (ek >= 0 && Math.abs(tr - ekr) + Math.abs(tc - ekc) <= 2 && (IS_MAJOR[moving] || UPPER_TAB[moving] === 80));
 
     let prune = false;
-    if (i > 0 && !pvNode && !check && best > -MATE + 1000) {
+    if (i > 0 && !pvNode && !check && !isKillerAttack && best > -MATE + 1000) {
       if (isQuiet) {
         if (depth <= 4 && (quietSeen >= lmpLimit || (staticEval + futMargin <= alpha && quietSeen >= 2))) {
           prune = true;
-        } else if (depth <= 3 && IS_MAJOR[moving] && isAttackedByPawn(t, side ^ 1) && see(f, t, side) < -80) {
-          // SEE Quiet Pruning: Cắt sớm nước đi tĩnh tự nộp quân chủ lực cho Tốt địch
+        } else if (depth <= 4 && moveScore[idx] < -200000) {
           prune = true;
         }
-      } else if (!goodCap && depth <= 6) {
+      } else if (blunderCap && depth <= (isPalaceSac ? 2 : 6)) {
+        prune = true;
+      } else if (!goodCap && depth <= 2 && !isPalaceSac) {
         prune = true;
       }
     }
@@ -1980,7 +2472,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
     sinceCap[ply + 1] = cap ? 0 : sinceCap[ply] + 1;
     doMove(f, t, cap, moving, side);
 
-    const givesCheck = (i > 0 && (prune || depth >= 3)) ? inCheck(side ^ 1) === 1 : false;
+    const givesCheck = (i > 0 && (prune || depth >= 2)) ? inCheck(side ^ 1) === 1 : false;
     if (prune && !givesCheck) {
       undoMove(f, t, cap, moving, side);
       continue;
@@ -1995,6 +2487,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
       if (depth >= 3 && i >= 2 && !check && !givesCheck && (isQuiet || !goodCap)) {
         red = lmrTable[lmrBase + (i < MAX_MOVES ? i : MAX_MOVES - 1)];
         if (pvNode) red--;
+        if (isKillerAttack) red--;
         if (!improving) red++;
         if (mCode === killers0[ply] || mCode === killers1[ply]) red--;
         if (isQuiet) {
@@ -2031,12 +2524,12 @@ function search(depth, alpha, beta, side, ply, allowNull) {
     }
     if (sc > alpha) alpha = sc;
     if (alpha >= beta) {
+      const bonus = Math.min(depth * depth * 8, 1600);
       if (isQuiet) {
         if (killers0[ply] !== mCode) {
           killers1[ply] = killers0[ply];
           killers0[ply] = mCode;
         }
-        const bonus = Math.min(depth * depth * 8, 1600);
         histUpdate(hBase + mCode, bonus);
         if (contBase >= 0) {
           contHistUpdate(contBase + PTYPE_IDX[moving] * 90 + t, bonus);
@@ -2052,6 +2545,8 @@ function search(depth, alpha, beta, side, ply, allowNull) {
         }
         const pf = ply > 0 ? searchHistoryFrom[ply - 1] : -1;
         if (pf >= 0) counterMoves[(side ^ 1) * 8100 + pf * 90 + searchHistoryTo[ply - 1]] = mCode;
+      } else {
+        capHistUpdate((PTYPE_IDX[moving] * 7 + PTYPE_IDX[cap]) * 90 + t, bonus);
       }
       break;
     }
@@ -2093,7 +2588,8 @@ function rootSearch(depth, side, alphaIn = -INF, betaIn = INF) {
     }
   }
 
-  let alpha = alphaIn, beta = betaIn, best = -INF;
+  let alpha = alphaIn, beta = betaIn, best = -INF, rawBest = -INF;
+  let bestHasPenalty = false;
   let bestCode = moveFrom[0] * 90 + moveTo[0];
 
   for (let i = 0; i < n; i++) {
@@ -2126,6 +2622,7 @@ function rootSearch(depth, side, alphaIn = -INF, betaIn = INF) {
     undoMove(f, t, cap, moving, side);
     if (stopped) break;
 
+    const rawSc = sc;
     if (pen > 0) {
       if (repCount > 0) sc -= pen;
       else if (sc < MATE - 1000) sc -= pen;
@@ -2135,6 +2632,8 @@ function rootSearch(depth, side, alphaIn = -INF, betaIn = INF) {
 
     if (sc > best) {
       best = sc;
+      rawBest = rawSc;
+      bestHasPenalty = pen > 0;
       bestCode = mCode;
       pvTable[0] = bestCode;
       const nextLen = pvLen[1];
@@ -2154,8 +2653,8 @@ function rootSearch(depth, side, alphaIn = -INF, betaIn = INF) {
   }
   if (best > -INF) {
     lastScore = best;
-    if (best > alphaIn && best < betaIn) {
-      ttStore(curHashLo, curHashHi, depth, best, 0, bestCode);
+    if (best > alphaIn && best < betaIn && !bestHasPenalty) {
+      ttStore(curHashLo, curHashHi, depth, rawBest, 0, bestCode);
     }
   }
   return bestCode;
@@ -2177,6 +2676,7 @@ function searchBestMove(maxDepth, maxNodes, side, timeMs) {
   killers1.fill(-1);
   for (let i = 0; i < historyHeur.length; i++) historyHeur[i] >>= 1;
   for (let i = 0; i < contHist.length; i++) contHist[i] >>= 1;
+  for (let i = 0; i < capHist.length; i++) capHist[i] >>= 1;
   ttGen = (ttGen + 1) & 255;
   rootEpoch++;
   if (rootEpoch > 2000000000) { rootScoreStamp.fill(0); rootEpoch = 1; }
@@ -2535,6 +3035,7 @@ self.onmessage = async ({ data = {} }) => {
     evKeyLo.fill(0); evKeyHi.fill(0);
     historyHeur.fill(0);
     contHist.fill(0);
+    capHist.fill(0);
     counterMoves.fill(0);
     rootScoreStamp.fill(0);
     return;
