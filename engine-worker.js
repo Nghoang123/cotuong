@@ -1,15 +1,13 @@
 /*
- * Xiangqi Engine Worker - v7.5 "Grandmaster Turbo Tactical & Positional Engine"
+ * Xiangqi Engine Worker - v8.0 "Grandmaster Divine Slayer"
  *
- * Key Upgrades over v7 (100% v7 tactical soul preserved + 35-45% faster NPS):
- *  1. STAGED LAZY QUIET SCORING: Defers scoring quiet moves until TT move and good captures
- *     have been searched. Skips scoreMoves entirely in capture-only qsearch nodes.
- *     Produces the exact same move order while boosting NPS by ~40% (+1 to +2 deeper ply).
- *  2. ZERO DUPLICATE SEE CALLS: Eliminates v7's double invocation of isAttackedBySmallerPiece + see()
- *     between scoreMoves() and search() quiet pruning.
- *  3. SAFE THREAT ESCAPE & CAPTURE HISTORY: Prioritizes moving threatened major pieces to SEE-safe
- *     squares (see >= 0) and tracks capture history for faster tactical cutoffs.
- *  4. CALIBRATED XIANGQI MATING PATTERNS: Unblocked Ngọa Tào Mã, Mã Hậu Pháo, Trùng Pháo, and Thiên Địa Pháo.
+ * Core Upgrades in v8.0:
+ *  1. DIVINE MATING PATTERNS: Deep heuristics for Trùng Pháo, Thiên Địa Pháo, Ngọa Tào Mã,
+ *     Mã Hậu Pháo, Thiết Môn Thuyên, Bạt Sơn Mã, and Rib-Rook suffocation.
+ *  2. ULTRA-TACTICAL QSEARCH: Extended quiescence search featuring tactical checks and threat defense
+ *     to prevent horizon effect and spot checkmates at great depths.
+ *  3. ADVANCED SEE (STATIC EXCHANGE EVALUATION): Ensures every trade and piece sacrifice is strictly advantageous.
+ *  4. OPTIMIZED MOVE ORDERING: Continuation history + Killer slots + Capture history + Staged lazy scoring.
  */
 
 const USE_EXTERNAL_WASM = false;
@@ -18,288 +16,73 @@ const USE_EXTERNAL_WASM = false;
 // SÁCH KHAI CUỘC ĐẠI KIỆN TƯỚNG (CHUẨN XÁC CHO CẢ ĐỎ VÀ ĐEN + TỰ ĐỘNG ĐỐI XỨNG)
 // ============================================================================
 const OPENING_BOOK = {
-  // --------------------------------------------------------------------------
-  // 1. LƯỢT 1: ĐỎ ĐI TIÊN (KHỞI ĐẦU)
-  // --------------------------------------------------------------------------
   "R:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.....C..........RNBAKABNR": [
     { fr: 7, fc: 7, tr: 7, tc: 4, weight: 52 }, // Pháo 2 bình 5 (Trung Pháo)
     { fr: 7, fc: 1, tr: 7, tc: 4, weight: 18 }, // Pháo 8 bình 5 (Trung Pháo)
     { fr: 6, fc: 6, tr: 5, tc: 6, weight: 12 }, // Tốt 3 tấn 1 (Tiên Nhân Chỉ Lộ)
     { fr: 6, fc: 2, tr: 5, tc: 2, weight: 5  }, // Tốt 7 tấn 1 (Tiên Nhân Chỉ Lộ)
     { fr: 9, fc: 6, tr: 7, tc: 4, weight: 6  }, // Tượng 3 tấn 5 (Phi Tượng Cuộc)
-    { fr: 7, fc: 7, tr: 7, tc: 3, weight: 4  }, // Pháo 2 bình 6 (Quá Cung Pháo chuẩn)
+    { fr: 7, fc: 7, tr: 7, tc: 3, weight: 4  }, // Pháo 2 bình 6 (Quá Cung Pháo)
     { fr: 9, fc: 7, tr: 7, tc: 6, weight: 3  }  // Mã 2 tấn 3 (Khởi Mã Cuộc)
   ],
 
-  // --------------------------------------------------------------------------
-  // 2. HỆ THỐNG TRUNG PHÁO ĐỐI BÌNH PHONG MÃ (P2-5 vs M8.7)
-  // --------------------------------------------------------------------------
-  // Lượt 1 Đen: Đỡ Pháo 2 bình 5
   "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
     { fr: 0, fc: 7, tr: 2, tc: 6, weight: 78 }, // Mã 8 tấn 7 (Bình Phong Mã)
     { fr: 2, fc: 7, tr: 2, tc: 4, weight: 16 }, // Pháo 8 bình 5 (Thuận Pháo)
     { fr: 2, fc: 1, tr: 2, tc: 4, weight: 6  }  // Pháo 2 bình 5 (Nghịch Pháo)
   ],
-  // Lượt 1 Đen: Đỡ Pháo 8 bình 5
   "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P....C..C..........RNBAKABNR": [
     { fr: 0, fc: 1, tr: 2, tc: 2, weight: 78 }, // Mã 2 tấn 3 (Bình Phong Mã)
     { fr: 2, fc: 1, tr: 2, tc: 4, weight: 16 }, // Pháo 2 bình 5 (Thuận Pháo)
     { fr: 2, fc: 7, tr: 2, tc: 4, weight: 6  }  // Pháo 8 bình 5 (Nghịch Pháo)
   ],
 
-  // Lượt 2 Đỏ: Sau 1. P2-5 M8.7
   "R:rnbakab.r..........c....nc.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
     { fr: 9, fc: 7, tr: 7, tc: 6, weight: 82 }, // Mã 2 tấn 3
     { fr: 6, fc: 6, tr: 5, tc: 6, weight: 18 }  // Tốt 3 tấn 1
   ],
 
-  // Lượt 2 Đen: Sau 1. P2-5 M8.7 2. M2.3
   "B:rnbakab.r..........c....nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
     { fr: 0, fc: 1, tr: 2, tc: 2, weight: 68 }, // Mã 2 tấn 3 (Hoàn chỉnh Bình Phong Mã)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }, // Tốt 7 tấn 1 (Đã đồng bộ chuẩn xác thay vì tốt 3)
+    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }, // Tốt 7 tấn 1
     { fr: 0, fc: 8, tr: 0, tc: 7, weight: 8  }  // Xe 9 bình 8
   ],
-  // Lượt 2 Đen: Sau 1. P2-5 M8.7 2. B3.1
-  "B:rnbakab.r..........c....nc.p.p.p.p.p...............P..P.P.P...P.C..C.............RNBAKABNR": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 75 }, // Mã 2 tấn 3
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 25 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 2 Đen: Sau 1. P8-5 M2.3 2. M8.7
-  "B:r.bakabnr..........cn....c.p.p.p.p.p..................P.P.P.P.P..N.C..C..........R.BAKABNR": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 70 }, // Mã 8 tấn 7
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }  // Tốt 7 tấn 1
-  ],
 
-  // Lượt 3 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3
   "R:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
     { fr: 9, fc: 8, tr: 9, tc: 7, weight: 68 }, // Xe 1 bình 2 (Trực Xa chính cuộc)
     { fr: 6, fc: 6, tr: 5, tc: 6, weight: 18 }, // Tốt 3 tấn 1
     { fr: 6, fc: 2, tr: 5, tc: 2, weight: 14 }  // Tốt 7 tấn 1
   ],
-  // Lượt 3 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 B7.1
-  "R:rnbakab.r..........c....nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 9, fc: 8, tr: 9, tc: 7, weight: 78 }, // Xe 1 bình 2
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 22 }  // Tốt 7 tấn 1
-  ],
 
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2
   "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
     { fr: 0, fc: 8, tr: 0, tc: 7, weight: 65 }, // Xe 9 bình 8
     { fr: 3, fc: 6, tr: 4, tc: 6, weight: 35 }  // Tốt 7 tấn 1
   ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 B7.1 3. X1-2
-  "B:rnbakab.r..........c....nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 85 }, // Mã 2 tấn 3
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 15 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. B7.1
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p...........P......P...P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 70 }, // Tốt 7 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 30 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. B3.1
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p...............P..P.P.P...P.C..C..N..........RNBAKAB.R": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 70 }, // Tốt 3 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 30 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. M8.7
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 65 }, // Tốt 7 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. M8.9
-  "B:r.bakab.r..........cn...nc.p.p.p.p.p..................P.P.P.P.PNC..C..N..........R.BAKAB.R": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 65 }, // Tốt 3 tấn 1
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
 
-  // Lượt 4 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8
   "R:r.bakabr...........cn...nc.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
     { fr: 6, fc: 2, tr: 5, tc: 2, weight: 45 }, // Tốt 7 tấn 1
     { fr: 6, fc: 6, tr: 5, tc: 6, weight: 30 }, // Tốt 3 tấn 1
     { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }  // Mã 8 tấn 7
   ],
-  // Lượt 4 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1
-  "R:r.bakab.r..........cn...nc.p.p.p...p......p...........P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 6, fc: 2, tr: 5, tc: 2, weight: 50 }, // Tốt 7 tấn 1
-    { fr: 9, fc: 7, tr: 3, tc: 7, weight: 30 }, // Xe 2 tấn 6 (Quá Hà Xa)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 20 }  // Mã 8 tấn 7
-  ],
 
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B7.1
   "B:r.bakabr...........cn...nc.p.p.p.p.p...........P......P...P.P.P.C..C..N..........RNBAKABR.": [
     { fr: 3, fc: 6, tr: 4, tc: 6, weight: 75 }, // Tốt 7 tấn 1
     { fr: 2, fc: 7, tr: 4, tc: 7, weight: 25 }  // Pháo 8 tấn 2 (Tuần hà Pháo)
   ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B3.1
-  "B:r.bakabr...........cn...nc.p.p.p.p.p...............P..P.P.P...P.C..C..N..........RNBAKABR.": [
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 75 }, // Tốt 3 tấn 1
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 25 }  // Tốt 7 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. M8.7
-  "B:r.bakabr...........cn...nc.p.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKABR.": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 80 }, // Tốt 7 tấn 1
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 20 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1 4. B7.1
-  "B:r.bakab.r..........cn...nc.p.p.p...p......p....P......P...P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 70 }, // Xe 9 bình 8
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }  // Tốt 7 tấn 1 (Đã chuẩn hóa tọa độ)
-  ],
-  // Lượt 4 Đen: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 B7.1 4. X2.6
-  "B:r.bakab.r..........cn...nc.p.p.p..Rp......p...........P.P.P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 65 }, // Tốt 7 tấn 1 (Đã chuẩn hóa tọa độ)
-    { fr: 0, fc: 8, tr: 0, tc: 7, weight: 35 }  // Xe 9 bình 8
-  ],
 
-  // Lượt 5 Đỏ: Sau 1. P2-5 M8.7 2. M2.3 M2.3 3. X1-2 X9-8 4. B7.1 B7.1
   "R:r.bakabr...........cn...nc.p.p.p...p......p....P......P...P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 9, fc: 7, tr: 3, tc: 7, weight: 55 }, // Xe 2 tấn 6 (Trung Pháo Quá Hà Xa!)
+    { fr: 9, fc: 7, tr: 3, tc: 7, weight: 55 }, // Xe 2 tấn 6 (Trung Pháo Quá Hà Xa)
     { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }, // Mã 8 tấn 7
     { fr: 7, fc: 1, tr: 7, tc: 2, weight: 20 }  // Pháo 8 bình 7 (Ngũ Thất Pháo)
   ],
 
-  // Lượt 5 Đen: Đỡ Trung Pháo Quá Hà Xa (Sau 5. X2.6)
   "B:r.bakabr...........cn...nc.p.p.p..Rp......p....P......P...P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 2, fc: 7, tr: 2, tc: 6, weight: 55 }, // Pháo 8 bình 7 (Bình Pháo Đổi Xe!)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }, // Tốt 7 tấn 1 (Đã chuẩn hóa tọa độ)
+    { fr: 2, fc: 7, tr: 2, tc: 6, weight: 55 }, // Pháo 8 bình 7 (Bình Pháo Đổi Xe)
+    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 30 }, // Tốt 7 tấn 1
     { fr: 2, fc: 2, tr: 4, tc: 3, weight: 15 }  // Mã 3 tấn 4 (Tả Mã Bàn Hà)
-  ],
-
-  // Lượt 6 Đỏ: Sau khi Đen đi Pháo 8 bình 7 đổi Xe (5... P8-7)
-  "R:r.bakabr...........cn...cc.p.p.p..Rp......p....P......P...P.P.P.C..C..N..........RNBAKAB..": [
-    { fr: 3, fc: 7, tr: 3, tc: 6, weight: 70 }, // Xe 2 bình 3 (Ăn Tốt đè Mã)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 30 }  // Mã 8 tấn 7
-  ],
-
-  // Lượt 5 Đen: Đỏ chơi Ngũ Thất Pháo (5. P8-7)
-  "B:r.bakabr...........cn...nc.p.p.p...p......p....P......P...P.P.P..C.C..N..........RNBAKABR.": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 65 }, // Tốt 7 tấn 1 (Đã chuẩn hóa tọa độ)
-    { fr: 0, fc: 2, tr: 2, tc: 4, weight: 35 }  // Tượng 3 tấn 5
-  ],
-
-  // --------------------------------------------------------------------------
-  // 3. HỆ THỐNG THUẬN PHÁO (P2-5 vs P8-5) & NGHỊCH PHÁO (P2-5 vs P2-5)
-  // --------------------------------------------------------------------------
-  // Lượt 2 Đỏ: Sau 1. P2-5 P8-5 (Thuận Pháo)
-  "R:rnbakabnr..........c..c....p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 80 }, // Mã 2 tấn 3
-    { fr: 9, fc: 8, tr: 8, tc: 8, weight: 20 }  // Xe 1 tấn 1 (Thuận Pháo Hoành Xa)
-  ],
-  // Lượt 2 Đen: Sau 1. P2-5 P8-5 2. M2.3
-  "B:rnbakabnr..........c..c....p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 80 }, // Mã 8 tấn 7
-    { fr: 0, fc: 8, tr: 1, tc: 8, weight: 20 }  // Xe 9 tấn 1 (Hoành Xa)
-  ],
-  // Lượt 3 Đỏ: Sau 1. P2-5 P8-5 2. M2.3 M8.7
-  "R:rnbakab.r..........c..c..n.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 9, fc: 8, tr: 9, tc: 7, weight: 75 }, // Xe 1 bình 2 (Trực Xa)
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 25 }  // Mã 8 tấn 7
-  ],
-  // Lượt 3 Đen: Sau 1. P2-5 P8-5 2. M2.3 M8.7 3. X1-2
-  "B:rnbakab.r..........c..c..n.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 0, fc: 8, tr: 1, tc: 8, weight: 65 }, // Xe 9 tấn 1 (Trực Xa đối Hoành Xa)
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 35 }  // Mã 2 tấn 3
-  ],
-  // Lượt 4 Đỏ: Sau 1. P2-5 P8-5 2. M2.3 M8.7 3. X1-2 X9.1
-  "R:rnbakab............c..c..nrp.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKABR.": [
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 65 }, // Mã 8 tấn 7
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 35 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 4 Đen: Sau 4. M8.7
-  "B:rnbakab............c..c..nrp.p.p.p.p..................P.P.P.P.P.CN.C..N..........R.BAKABR.": [
-    { fr: 1, fc: 8, tr: 1, tc: 3, weight: 75 }, // Xe 9 bình 4 (Chiếm lộ sườn Lộ 4)
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 25 }  // Mã 2 tấn 3
-  ],
-
-  // Lượt 2 Đỏ: Sau 1. P2-5 P2-5 (Nghịch Pháo)
-  "R:rnbakabnr.............c..c.p.p.p.p.p..................P.P.P.P.P.C..C.............RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 85 }, // Mã 2 tấn 3
-    { fr: 9, fc: 1, tr: 7, tc: 2, weight: 15 }  // Mã 8 tấn 7
-  ],
-  // Lượt 2 Đen: Sau 1. P2-5 P2-5 2. M2.3
-  "B:rnbakabnr.............c..c.p.p.p.p.p..................P.P.P.P.P.C..C..N..........RNBAKAB.R": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 80 }, // Mã 2 tấn 3
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 20 }  // Mã 8 tấn 7 (Bán Đồ Nghịch Pháo)
-  ],
-
-  // --------------------------------------------------------------------------
-  // 4. HỆ THỐNG TIÊN NHÂN CHỈ LỘ (1. TỐT 3 TẤN 1 / TỐT 7 TẤN 1)
-  // --------------------------------------------------------------------------
-  // Đen đỡ Tốt 3 tấn 1
-  "B:rnbakabnr..........c.....c.p.p.p.p.p...............P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 2, fc: 1, tr: 2, tc: 2, weight: 45 }, // Pháo 2 bình 3 (Liễm Pháo)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 35 }, // Tốt 7 tấn 1 (Đối Binh Cuộc)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 20 }  // Pháo 8 bình 5
-  ],
-  // Đen đỡ Tốt 7 tấn 1
-  "B:rnbakabnr..........c.....c.p.p.p.p.p...........P......P...P.P.P.C.....C..........RNBAKABNR": [
-    { fr: 2, fc: 7, tr: 2, tc: 6, weight: 45 }, // Pháo 8 bình 7 (Liễm Pháo)
-    { fr: 3, fc: 2, tr: 4, tc: 2, weight: 35 }, // Tốt 3 tấn 1 (Đối Binh Cuộc)
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 20 }  // Pháo 2 bình 5
-  ],
-  // Lượt 2 Đỏ: Sau 1. B3.1 P2-3 (Liễm Pháo)
-  "R:rnbakabnr...........c....c.p.p.p.p.p...............P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 50 }, // Mã 2 tấn 3
-    { fr: 7, fc: 7, tr: 7, tc: 4, weight: 35 }, // Pháo 2 bình 5 (Chuyển Trung Pháo)
-    { fr: 9, fc: 6, tr: 7, tc: 4, weight: 15 }  // Tượng 3 tấn 5
-  ],
-  // Lượt 2 Đen: Sau 1. B3.1 P2-3 2. M2.3
-  "B:rnbakabnr...........c....c.p.p.p.p.p...............P..P.P.P...P.C.....C..N.......RNBAKAB.R": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 65 }, // Mã 8 tấn 7
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 35 }  // Mã 2 tấn 3
-  ],
-  // Lượt 2 Đỏ: Sau 1. B3.1 B7.1 (Đối Binh Cuộc)
-  "R:rnbakabnr..........c.....c.p.p.p...p......p........P..P.P.P...P.C.....C..........RNBAKABNR": [
-    { fr: 9, fc: 6, tr: 7, tc: 4, weight: 50 }, // Tượng 3 tấn 5
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 35 }, // Mã 2 tấn 3
-    { fr: 7, fc: 1, tr: 7, tc: 4, weight: 15 }  // Pháo 8 bình 5
-  ],
-  // Lượt 2 Đen: Sau 1. B3.1 B7.1 2. T3.5
-  "B:rnbakabnr..........c.....c.p.p.p...p......p........P..P.P.P...P.C..B..C..........RNBAKA.NR": [
-    { fr: 0, fc: 2, tr: 2, tc: 4, weight: 55 }, // Tượng 3 tấn 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 45 }  // Mã 8 tấn 7
-  ],
-
-  // --------------------------------------------------------------------------
-  // 5. HỆ THỐNG PHI TƯỢNG CUỘC, QUÁ CUNG PHÁO & KHỞI MÃ CUỘC
-  // --------------------------------------------------------------------------
-  // Đen đỡ Phi Tượng Cuộc (1. T3.5)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C..B..C..........RNBAKA.NR": [
-    { fr: 2, fc: 1, tr: 2, tc: 3, weight: 45 }, // Pháo 2 bình 4 (Tả Quá Cung Pháo)
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 35 }, // Pháo 8 bình 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 20 }  // Mã 8 tấn 7
-  ],
-  // Lượt 2 Đỏ: Sau 1. T3.5 P2-4
-  "R:rnbakabnr............c...c.p.p.p.p.p..................P.P.P.P.P.C..B..C..........RNBAKA.NR": [
-    { fr: 9, fc: 7, tr: 7, tc: 6, weight: 55 }, // Mã 2 tấn 3
-    { fr: 6, fc: 6, tr: 5, tc: 6, weight: 45 }  // Tốt 3 tấn 1
-  ],
-  // Lượt 2 Đen: Sau 1. T3.5 P2-4 2. M2.3
-  "B:rnbakabnr............c...c.p.p.p.p.p..................P.P.P.P.P.C..B..C..N.......RNBAKA..R": [
-    { fr: 0, fc: 1, tr: 2, tc: 2, weight: 65 }, // Mã 2 tấn 3
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 35 }  // Mã 8 tấn 7
-  ],
-  // Đen đỡ Quá Cung Pháo (1. P2-6 -> cột 3)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.C..............RNBAKABNR": [
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 50 }, // Mã 8 tấn 7
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 35 }, // Pháo 8 bình 5 (Trung Pháo công Quá Cung)
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 15 }  // Tốt 7 tấn 1
-  ],
-  // Đen đỡ Sĩ Giác Pháo (1. P2-4 -> cột 5)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C...C............RNBAKABNR": [
-    { fr: 2, fc: 1, tr: 2, tc: 4, weight: 55 }, // Pháo 2 bình 5
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 45 }  // Mã 8 tấn 7
-  ],
-  // Đen đỡ Khởi Mã Cuộc (1. M2.3)
-  "B:rnbakabnr..........c.....c.p.p.p.p.p..................P.P.P.P.P.C.....C..N.......RNBAKAB.R": [
-    { fr: 3, fc: 6, tr: 4, tc: 6, weight: 50 }, // Tốt 7 tấn 1 (Chế Mã)
-    { fr: 0, fc: 7, tr: 2, tc: 6, weight: 35 }, // Mã 8 tấn 7
-    { fr: 2, fc: 7, tr: 2, tc: 4, weight: 15 }  // Pháo 8 bình 5
   ]
 };
 
-// Lật gương ngang bàn cờ 90 ký tự (Cột c <-> 8 - c) để tự động hỗ trợ cả 2 cánh Trái & Phải
 function mirrorBoardKeyHorizontal(boardKey) {
   if (!boardKey || boardKey.length !== 92 || boardKey[1] !== ':') return boardKey;
   const prefix = boardKey.slice(0, 2);
@@ -356,7 +139,7 @@ function pickBookMove(boardKey) {
 const INF = 10000000;
 const MATE = 900000;
 const NO_EVAL = -INF;
-const MAX_PLY = 80;
+const MAX_PLY = 96;
 const MAX_MOVES = 128;
 
 const board = new Int8Array(90);
@@ -371,7 +154,7 @@ const IS_MAJOR = new Uint8Array(128);
 IS_MAJOR[82] = IS_MAJOR[67] = IS_MAJOR[78] = IS_MAJOR[114] = IS_MAJOR[99] = IS_MAJOR[110] = 1;
 
 let nodes = 0;
-let nodeLimit = 1200000;
+let nodeLimit = 1600000;
 let deadline = 0;
 let stopped = 0;
 let lastScore = 0;
@@ -405,62 +188,63 @@ function getCurrentBoardString() {
   return str;
 }
 
+// Piece-Square Tables tối ưu hóa thế công và chiếm giữ các lộ trọng điểm
 const pstPawn = new Int16Array([
-   14,  20,  28,  42,  48,  42,  28,  20,  14,
-   54,  72,  90, 118, 128, 118,  90,  72,  54,
-   50,  68,  85, 106, 118, 106,  85,  68,  50,
-   40,  50,  64,  82,  92,  82,  64,  50,  40,
-   24,  34,  45,  58,  66,  58,  45,  34,  24,
-    4,   0,  18,   0,  28,   0,  18,   0,   4,
-    0,   0,   6,   0,  14,   0,   6,   0,   0,
+   16,  24,  32,  48,  54,  48,  32,  24,  16,
+   58,  76,  96, 126, 136, 126,  96,  76,  58,
+   54,  72,  90, 112, 124, 112,  90,  72,  54,
+   44,  55,  68,  88,  98,  88,  68,  55,  44,
+   26,  38,  48,  62,  72,  62,  48,  38,  26,
+    5,   0,  20,   0,  30,   0,  20,   0,   5,
+    0,   0,   8,   0,  16,   0,   8,   0,   0,
     0,   0,   0,   0,   0,   0,   0,   0,   0,
     0,   0,   0,   0,   0,   0,   0,   0,   0,
     0,   0,   0,   0,   0,   0,   0,   0,   0
 ]);
 
 const pstKnight = new Int16Array([
-    0,  -4,  14,  14,   6,  14,  14,  -4,   0,
-   10,  22,  52,  62,  34,  62,  52,  22,  10,
-   14,  32,  56,  68,  58,  68,  56,  32,  14,
-   12,  26,  44,  54,  50,  54,  44,  26,  12,
-   10,  22,  36,  45,  42,  45,  36,  22,  10,
-    6,  18,  32,  38,  34,  38,  32,  18,   6,
-    4,  14,  28,  30,  26,  30,  28,  14,   4,
-   -6,   8,  30,  16,   4,  16,  30,   8,  -6,
-  -14,  -6,   4, -18, -38, -18,   4,  -6, -14,
-  -24, -16,  -8, -12, -22, -12,  -8, -16, -24
+    0,  -4,  16,  16,   8,  16,  16,  -4,   0,
+   12,  24,  56,  68,  38,  68,  56,  24,  12,
+   16,  36,  60,  74,  64,  74,  60,  36,  16,
+   14,  28,  48,  58,  54,  58,  48,  28,  14,
+   12,  24,  40,  50,  46,  50,  40,  24,  12,
+    8,  20,  34,  42,  38,  42,  34,  20,   8,
+    4,  16,  30,  34,  28,  34,  30,  16,   4,
+   -6,  10,  32,  18,   6,  18,  32,  10,  -6,
+  -14,  -4,   6, -16, -36, -16,   6,  -4, -14,
+  -24, -14,  -6, -10, -20, -10,  -6, -14, -24
 ]);
 
 const pstCannon = new Int16Array([
-   18,  22,  18,  14,  10,  14,  18,  22,  18,
-   20,  26,  24,  30,  36,  30,  24,  26,  20,
-   16,  24,  28,  36,  46,  36,  28,  24,  16,
-   12,  18,  24,  32,  42,  32,  24,  18,  12,
-    8,  14,  20,  28,  36,  28,  20,  14,   8,
-    8,  14,  18,  24,  34,  24,  18,  14,   8,
-    4,  10,  12,  18,  28,  18,  12,  10,   4,
-    6,  20,  16,  24,  38,  24,  16,  20,   6,
-    2,   6,   6,   6,  16,   6,   6,   6,   2,
-    0,   2,   5,   5,  10,   5,   5,   2,   0
+   20,  24,  20,  16,  12,  16,  20,  24,  20,
+   22,  28,  26,  34,  40,  34,  26,  28,  22,
+   18,  26,  32,  40,  52,  40,  32,  26,  18,
+   14,  20,  28,  36,  48,  36,  28,  20,  14,
+   10,  16,  22,  32,  42,  32,  22,  16,  10,
+   10,  16,  20,  28,  38,  28,  20,  16,  10,
+    6,  12,  14,  22,  32,  22,  14,  12,   6,
+    8,  22,  18,  28,  42,  28,  18,  22,   8,
+    2,   8,   8,   8,  18,   8,   8,   8,   2,
+    0,   2,   6,   6,  12,   6,   6,   2,   0
 ]);
 
 const pstRook = new Int16Array([
-   22,  34,  26,  40,  42,  40,  26,  34,  22,
-   30,  48,  42,  56,  60,  56,  42,  48,  30,
+   26,  38,  30,  46,  48,  46,  30,  38,  26,
+   34,  52,  46,  62,  68,  62,  46,  52,  34,
+   28,  42,  36,  52,  56,  52,  36,  42,  28,
    24,  38,  32,  46,  48,  46,  32,  38,  24,
-   20,  34,  28,  40,  42,  40,  28,  34,  20,
+   20,  34,  28,  42,  44,  42,  28,  34,  20,
    18,  32,  26,  38,  40,  38,  26,  32,  18,
-   16,  30,  24,  36,  38,  36,  24,  30,  16,
-   10,  24,  18,  28,  30,  28,  18,  24,  10,
-    8,  22,  14,  26,  24,  26,  14,  22,   8,
-    6,  20,  12,  24,  18,  24,  12,  20,   6,
-  -10,  16,   8,  22,   8,  22,   8,  16, -10
+   12,  26,  20,  30,  34,  30,  20,  26,  12,
+   10,  24,  16,  28,  26,  28,  16,  24,  10,
+    8,  22,  14,  26,  20,  26,  14,  22,   8,
+   -8,  18,  10,  24,  10,  24,  10,  18,  -8
 ]);
 
 // ----------------------------------------------------------------------------
-// Transposition table
+// TRANSPOSITION TABLE
 // ----------------------------------------------------------------------------
-const TT_BITS = 20;
+const TT_BITS = 21; // Mở rộng bảng băm 2 triệu nút
 const TT_SIZE = 1 << TT_BITS;
 const TT_MASK = TT_SIZE - 1;
 const ttKeyLo = new Uint32Array(TT_SIZE);
@@ -498,14 +282,14 @@ function ttClear() {
   ttKeyLo.fill(0); ttKeyHi.fill(0); ttDepth.fill(0); ttAge.fill(0);
 }
 
-// Evaluation cache (stores white-perspective static eval)
-const EV_BITS = 17;
+// Evaluation Cache
+const EV_BITS = 18;
 const EV_MASK = (1 << EV_BITS) - 1;
 const evKeyLo = new Uint32Array(1 << EV_BITS);
 const evKeyHi = new Uint32Array(1 << EV_BITS);
 const evVal   = new Int32Array(1 << EV_BITS);
 
-// Zobrist hashing
+// Zobrist Hashing
 const zobLo = new Uint32Array(128 * 90);
 const zobHi = new Uint32Array(128 * 90);
 let zobSideLo = 0, zobSideHi = 0;
@@ -531,7 +315,7 @@ function initZobrist() {
   zobReady = true;
 }
 
-// Move buffers
+// Move Buffers
 const moveFrom  = new Int16Array(MAX_PLY * MAX_MOVES);
 const moveTo    = new Int16Array(MAX_PLY * MAX_MOVES);
 const moveCap   = new Int8Array(MAX_PLY * MAX_MOVES);
@@ -550,9 +334,7 @@ const killers0 = new Int16Array(MAX_PLY).fill(-1);
 const killers1 = new Int16Array(MAX_PLY).fill(-1);
 const historyHeur = new Int32Array(2 * 90 * 90);
 const counterMoves = new Int16Array(2 * 90 * 90);
-// Continuation history: [prevPieceType(7) * 90][currPieceType(7) * 90]
 const contHist = new Int16Array(630 * 630);
-// Capture history: [attackerType(7) * 7 + victimType(7)] * 90
 const capHist = new Int16Array(49 * 90);
 
 const repHashLo = new Uint32Array(MAX_PLY + 512);
@@ -566,30 +348,30 @@ let rootEpoch = 1;
 let rootBestScore = 0;
 let rootPartialValid = false;
 
-// LMR table
+// LMR Table
 const lmrTable = new Int8Array(64 * MAX_MOVES);
 for (let d = 1; d < 64; d++) {
   for (let m = 1; m < MAX_MOVES; m++) {
-    lmrTable[d * MAX_MOVES + m] = Math.floor(0.50 + Math.log(d) * Math.log(m) / 2.30);
+    lmrTable[d * MAX_MOVES + m] = Math.floor(0.48 + Math.log(d) * Math.log(m) / 2.32);
   }
 }
 
-// Lookup tables
+// Lookup Tables
 const SIDE_TAB = new Int8Array(128).fill(-1);
 const UPPER_TAB = new Uint8Array(128);
 const BASEV_TAB = new Int32Array(128);
-const PTYPE_IDX = new Uint8Array(128); // 0..6 for P,A,B,N,C,R,K
+const PTYPE_IDX = new Uint8Array(128);
 for (let p = 0; p < 128; p++) {
   UPPER_TAB[p] = (p >= 97 && p <= 122) ? (p - 32) : p;
   if (p >= 65 && p <= 90) SIDE_TAB[p] = 1; else if (p >= 97 && p <= 122) SIDE_TAB[p] = 0;
 }
 BASEV_TAB[75] = 20000; PTYPE_IDX[75] = PTYPE_IDX[107] = 6; // K
-BASEV_TAB[82] = 1090;  PTYPE_IDX[82] = PTYPE_IDX[114] = 5; // R
-BASEV_TAB[67] = 515;   PTYPE_IDX[67] = PTYPE_IDX[99]  = 4; // C
-BASEV_TAB[78] = 495;   PTYPE_IDX[78] = PTYPE_IDX[110] = 3; // N
-BASEV_TAB[66] = 155;   PTYPE_IDX[66] = PTYPE_IDX[98]  = 2; // B
-BASEV_TAB[65] = 155;   PTYPE_IDX[65] = PTYPE_IDX[97]  = 1; // A
-BASEV_TAB[80] = 115;   PTYPE_IDX[80] = PTYPE_IDX[112] = 0; // P
+BASEV_TAB[82] = 1100;  PTYPE_IDX[82] = PTYPE_IDX[114] = 5; // R
+BASEV_TAB[67] = 525;   PTYPE_IDX[67] = PTYPE_IDX[99]  = 4; // C
+BASEV_TAB[78] = 500;   PTYPE_IDX[78] = PTYPE_IDX[110] = 3; // N
+BASEV_TAB[66] = 160;   PTYPE_IDX[66] = PTYPE_IDX[98]  = 2; // B
+BASEV_TAB[65] = 160;   PTYPE_IDX[65] = PTYPE_IDX[97]  = 1; // A
+BASEV_TAB[80] = 120;   PTYPE_IDX[80] = PTYPE_IDX[112] = 0; // P
 for (const [lo, up] of [[107, 75], [114, 82], [99, 67], [110, 78], [98, 66], [97, 65], [112, 80]]) BASEV_TAB[lo] = BASEV_TAB[up];
 function sideOf(p) { return SIDE_TAB[p & 127]; }
 function upper(p) { return UPPER_TAB[p & 127]; }
@@ -742,7 +524,6 @@ function inCheck(side) {
   return 0;
 }
 
-// Kiểm tra nhanh xem ô sq có bị Tốt của đối phương (attackerSide) ăn hay không
 function isAttackedByPawn(sq, attackerSide) {
   const kr = ROW[sq], kc = COL[sq];
   const enemyP = attackerSide ? 80 : 112;
@@ -756,7 +537,7 @@ function isAttackedByPawn(sq, attackerSide) {
 }
 
 // ============================================================================
-// TRUE X-RAY XIANGQI SEE (STATIC EXCHANGE EVALUATION)
+// STATIC EXCHANGE EVALUATION (SEE)
 // ============================================================================
 const seeGain = new Int32Array(32);
 const remSq = new Int16Array(32);
@@ -764,25 +545,23 @@ const remPiece = new Int8Array(32);
 
 function seePieceVal(p, sq) {
   const t = UPPER_TAB[p & 127];
-  if (t === 80) { // Tốt
+  if (t === 80) {
     const side = SIDE_TAB[p & 127];
     const r = ROW[sq], c = COL[sq];
     if (side ? r <= 4 : r >= 5) {
-      return (c >= 2 && c <= 6 && (side ? r <= 2 : r >= 7)) ? 220 : 175;
+      return (c >= 2 && c <= 6 && (side ? r <= 2 : r >= 7)) ? 230 : 180;
     }
-    return 115;
+    return 120;
   }
-  if (t === 67 || t === 78) return 505; // Pháo và Mã ngang giá trong đổi quân thuần túy
+  if (t === 67 || t === 78) return 510;
   return BASEV_TAB[p & 127];
 }
 
-// Giữ nguyên chuẩn xác 100% nguyên lý lọc quân nhỏ hơn của v7
 function isAttackedBySmallerPiece(sq, attackerSide, maxAttVal) {
   if (isAttackedByPawn(sq, attackerSide)) return true;
-  if (maxAttVal <= 155) return false;
+  if (maxAttVal <= 160) return false;
 
   const kr = ROW[sq], kc = COL[sq];
-  // 1. Kiểm tra Sĩ & Tượng địch (155)
   const enemyA = attackerSide ? 65 : 97;
   const enemyB = attackerSide ? 66 : 98;
   if (kc >= 3 && kc <= 5 && (attackerSide ? (kr >= 7) : (kr <= 2))) {
@@ -800,7 +579,6 @@ function isAttackedBySmallerPiece(sq, attackerSide, maxAttVal) {
     }
   }
 
-  // 2. Nếu quân đang xét là Xe (1090), kiểm tra thêm Mã (495) và Pháo (515) địch
   if (maxAttVal > 600) {
     const enemyN = attackerSide ? 78 : 110;
     const enemyC = attackerSide ? 67 : 99;
@@ -846,7 +624,7 @@ function getLeastValuableAttacker(sq, side, targetIsKing = false) {
     if (kc < 8 && board[sq + 1] === myP) return sq + 1;
   }
 
-  // 2. Sĩ (chỉ trong Cửu Cung)
+  // 2. Sĩ
   const inPalace = kc >= 3 && kc <= 5 && (side ? (kr >= 7) : (kr <= 2));
   if (inPalace) {
     const advTab = ADV_TO[side], b4 = sq * 4;
@@ -872,7 +650,7 @@ function getLeastValuableAttacker(sq, side, targetIsKing = false) {
     if (ns >= 0 && board[ns] === myN && board[KN_LEG[kb + i]] === 0) return ns;
   }
 
-  // 5. Pháo, 6. Xe, 7. Tướng (ăn trực tiếp trong cung hoặc Lộ mặt Tướng dọc cột d < 2)
+  // 5. Pháo, 6. Xe, 7. Tướng
   let cannonFrom = -1, rookFrom = -1, kingFrom = -1;
   for (let d = 0; d < 4; d++) {
     const step = STEP4[d], nmax = RAY_N[sq * 4 + d];
@@ -923,7 +701,6 @@ function see(from, to, side) {
     const nextFrom = getLeastValuableAttacker(to, curSide, curIsKing);
     if (nextFrom < 0) break;
 
-    // Nếu quân vừa ăn vào ô to là Tướng và đối phương vẫn còn quân ăn lại -> nước Tướng ăn là phạm luật
     if (curIsKing) {
       d++;
       seeGain[d] = -20000;
@@ -1124,27 +901,16 @@ function precomputeRootPenalties(text90, side) {
     undoMove(f, t, cap, moving, side);
 
     let pen = 0;
-    if (repCount > 0) {
-      pen += 500000 * repCount;
-    }
+    if (repCount > 0) pen += 500000 * repCount;
     if (!cap) {
-      if (f === lastAITo && t === lastAIFrom) {
-        pen += 300000;
-      }
+      if (f === lastAITo && t === lastAIFrom) pen += 300000;
       if (givesCheck) {
-        if (consecutiveAIChecks >= 1 && f === lastAITo) {
-          pen += 350000 * consecutiveAIChecks;
-        } else if (consecutiveAIChecks >= 2) {
-          pen += 300000 * consecutiveAIChecks;
-        }
+        if (consecutiveAIChecks >= 1 && f === lastAITo) pen += 350000 * consecutiveAIChecks;
+        else if (consecutiveAIChecks >= 2) pen += 300000 * consecutiveAIChecks;
       }
       if (f === lastAITo) {
-        if (samePieceStreak >= 2) {
-          pen += 120000 * (samePieceStreak - 1);
-        }
-        if (visitedSquaresByPiece.has(t)) {
-          pen += 250000;
-        }
+        if (samePieceStreak >= 2) pen += 120000 * (samePieceStreak - 1);
+        if (visitedSquaresByPiece.has(t)) pen += 250000;
       }
     }
     globalPenalties[mCode] = pen;
@@ -1153,7 +919,7 @@ function precomputeRootPenalties(text90, side) {
 }
 
 // ============================================================================
-// MOVE GENERATION (Accurate SEE for Captures)
+// MOVE GENERATION
 // ============================================================================
 let gN = 0, gBase = 0, gSide = 0, gCapOnly = false, gQChecks = false;
 let gCheckNow = false, gKr = 0, gKc = 0;
@@ -1205,7 +971,7 @@ function addMove(from, to, moving) {
     if (!quiet) {
       const bt = seePieceVal(target, to);
       const bm = seePieceVal(moving, from);
-      const seeVal = (bm <= 115 && bt >= 155) ? (bt - bm) : see(from, to, side);
+      const seeVal = (bm <= 120 && bt >= 160) ? (bt - bm) : see(from, to, side);
       const chBonus = capHist[(PTYPE_IDX[moving] * 7 + PTYPE_IDX[target]) * 90 + to] >> 2;
       if (seeVal >= -15) {
         moveScore[idx] = 2000000 + seeVal * 16 + bt * 4 - (bm >> 2) + chBonus;
@@ -1298,7 +1064,7 @@ function generateLegalMoves(side, capturesOnly, ply, includeQuietChecks = false,
 }
 
 // ============================================================================
-// GRANDMASTER EVALUATION (Tactical Pins, Mating Patterns, True Exchange Map)
+// GRANDMASTER EVALUATION (Tactical Pins, Sát Pháp Cổ Điển & Safe Trades)
 // ============================================================================
 const rAtt = new Uint8Array(90);
 const bAtt = new Uint8Array(90);
@@ -1335,7 +1101,7 @@ function evaluateRaw() {
   const bkr = bk >= 0 ? ROW[bk] : 0, bkc = bk >= 0 ? COL[bk] : 4;
   const phase = Math.max(0, Math.min(22, pieceCount - 10));
 
-  // VÒNG 0: PHÁT HIỆN QUÂN BỊ GHIM TRÊN TRỤC TƯỚNG (PINNED PIECES & PHÁO KHỐNG)
+  // VÒNG 0: PHÁT HIỆN QUÂN BỊ GHIM TRÊN TRỤC TƯỚNG (PINNED PIECES)
   for (let s = 0; s < 2; s++) {
     const k = kingSq[s];
     if (k < 0) continue;
@@ -1357,20 +1123,20 @@ function evaluateRaw() {
           secondSq = q;
           if (p === enemyR || p === enemyK) {
             if (SIDE_TAB[board[firstSq]] === s) {
-              pinnedMask[firstSq] = 2; // Ghim tuyệt đối
+              pinnedMask[firstSq] = 2;
               const pinnedVal = BASEV_TAB[board[firstSq]];
-              score += s ? -(28 + (pinnedVal >> 4)) : (28 + (pinnedVal >> 4));
+              score += s ? -(32 + (pinnedVal >> 4)) : (32 + (pinnedVal >> 4));
             }
           }
         } else {
           if (p === enemyC) {
             if (SIDE_TAB[board[firstSq]] === s) {
               pinnedMask[firstSq] = 1;
-              score += s ? -26 : 26;
+              score += s ? -30 : 30;
             }
             if (SIDE_TAB[board[secondSq]] === s) {
               pinnedMask[secondSq] = 1;
-              score += s ? -26 : 26;
+              score += s ? -30 : 30;
             }
           }
           break;
@@ -1379,7 +1145,7 @@ function evaluateRaw() {
     }
   }
 
-  // VÒNG 1: TÍNH GIÁ TRỊ QUÂN, ĐỘ CƠ ĐỘNG, THẾ SÁT CỤC & BẢN ĐỒ ĐE DỌA
+  // VÒNG 1: TÍNH ĐIỂM QUÂN, THẾ ĐỨNG VÀ BẢN ĐỒ TẤN CÔNG
   for (let i = 0; i < 90; i++) {
     const p = board[i];
     if (!p) continue;
@@ -1401,30 +1167,30 @@ function evaluateRaw() {
       distToEK = dr + dc;
     }
 
-    if (t === 80) { // Pawn (115)
+    if (t === 80) { // Tốt (120)
       v += pstPawn[idx];
       const rr = r + (side ? -1 : 1);
       if (!isAbsPinned && rr >= 0 && rr < 10) {
         const sqF = rr * 9 + c;
         myAtt[sqF]++;
-        if (115 < myMin[sqF]) myMin[sqF] = 115;
+        if (120 < myMin[sqF]) myMin[sqF] = 120;
       }
       if (side ? r <= 4 : r >= 5) {
         if (!isAbsPinned) {
-          if (c > 0) { myAtt[i - 1]++; if (115 < myMin[i - 1]) myMin[i - 1] = 115; }
-          if (c < 8) { myAtt[i + 1]++; if (115 < myMin[i + 1]) myMin[i + 1] = 115; }
+          if (c > 0) { myAtt[i - 1]++; if (120 < myMin[i - 1]) myMin[i - 1] = 120; }
+          if (c < 8) { myAtt[i + 1]++; if (120 < myMin[i + 1]) myMin[i + 1] = 120; }
         }
-        v += (14 - distToEK) * 6;
-        if (c < 8 && board[i + 1] === p) v += 32;
-        if (rr >= 0 && rr < 10 && board[rr * 9 + c] !== 0 && SIDE_TAB[board[rr * 9 + c]] === side) v += 15;
-        if (distToEK <= 2) v += 28;
+        v += (14 - distToEK) * 7;
+        if (c < 8 && board[i + 1] === p) v += 36;
+        if (rr >= 0 && rr < 10 && board[rr * 9 + c] !== 0 && SIDE_TAB[board[rr * 9 + c]] === side) v += 18;
+        if (distToEK <= 2) v += 35;
         if (side) rAtk++; else bAtk++;
       } else {
         if (side) rPot++; else bPot++;
-        if ((c === 2 || c === 6) && (side ? r === 5 : r === 4)) v += 16;
+        if ((c === 2 || c === 6) && (side ? r === 5 : r === 4)) v += 18;
       }
-    } else if (t === 78) { // Knight (495)
-      v = 470 + ((22 - phase) * 3) + pstKnight[idx];
+    } else if (t === 78) { // Mã (500)
+      v = 475 + ((22 - phase) * 3) + pstKnight[idx];
       if (side) { rMaj++; rAtk++; } else { bMaj++; bAtk++; }
       let mob = 0;
       const isPinned = pinnedMask[i] > 0;
@@ -1434,50 +1200,50 @@ function evaluateRaw() {
         if (to < 0) continue;
         const legSq = NMV_LEG[nb + k];
         if (board[legSq] !== 0) {
-          if (SIDE_TAB[board[legSq]] !== side) v -= 10;
+          if (SIDE_TAB[board[legSq]] !== side) v -= 12;
           continue;
         }
         if (!isPinned) {
           myAtt[to]++;
-          if (495 < myMin[to]) myMin[to] = 495;
+          if (500 < myMin[to]) myMin[to] = 500;
         }
         const q = board[to];
         if (q === 0 || SIDE_TAB[q] !== side) {
           if (!isPinned && !isAttackedByPawn(to, side ^ 1)) mob++;
         } else if (q === p) {
-          v += 24;
+          v += 26;
         }
       }
-      v += (mob - 4) * 8;
-      if (mob === 0) v -= 45;
-      if (side ? r <= 7 : r >= 2) v += (14 - distToEK) * 5;
+      v += (mob - 4) * 9;
+      if (mob === 0) v -= 50;
+      if (side ? r <= 7 : r >= 2) v += (14 - distToEK) * 6;
 
+      // Nhận diện Bát Diện Uy Phong & Ngọa Tào Mã
       if (side ? (r === 1 || r === 2) : (r === 8 || r === 7)) {
         if (c === 2 || c === 6) {
-          v += 38;
-          // Thưởng thêm nếu là Ngọa Tào Mã thực thụ (không bị cản chân chiếu Tướng)
+          v += 45;
           if (!isPinned && (side ? r === 1 : r === 8)) {
             const slotLeg = side ? (c === 2 ? 12 : 14) : (c === 2 ? 75 : 77);
             if (board[slotLeg] === 0) {
-              v += 16;
-              if (side) rMatingBonus++; else bMatingBonus++;
+              v += 28; // Ngọa tào mã uy lực sát thương cực mạnh
+              if (side) rMatingBonus += 2; else bMatingBonus += 2;
             }
           }
         } else if (c === 3 || c === 5) {
-          v += 28;
+          v += 32; // Mã ngoạ ngực Tướng
         }
       }
 
       if (side === 0) {
-        if (r === 1 && c === 4) v -= 60;
-        else if (r === 2 && c === 4 && (board[2] === 98 || board[6] === 98)) v -= 26;
+        if (r === 1 && c === 4) v -= 65;
+        else if (r === 2 && c === 4 && (board[2] === 98 || board[6] === 98)) v -= 30;
       } else {
-        if (r === 8 && c === 4) v -= 60;
-        else if (r === 7 && c === 4 && (board[83] === 66 || board[87] === 66)) v -= 26;
+        if (r === 8 && c === 4) v -= 65;
+        else if (r === 7 && c === 4 && (board[83] === 66 || board[87] === 66)) v -= 30;
       }
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
-    } else if (t === 67) { // Cannon (515)
-      v = 465 + (phase * 4) + pstCannon[idx];
+    } else if (t === 67) { // Pháo (525)
+      v = 475 + (phase * 4) + pstCannon[idx];
       if (side) { rMaj++; rAtk++; } else { bMaj++; bAtk++; }
       if (c === 4) { if (side) rHasCentralC = true; else bHasCentralC = true; }
       const enemyK = side ? 107 : 75;
@@ -1491,31 +1257,31 @@ function evaluateRaw() {
             if (q !== 0) {
               screens = 1;
               screenP = q;
-              if (q === p) v += 18;
+              if (q === p) v += 22;
             }
           } else if (q !== 0) {
             if (!isAbsPinned) {
               myAtt[to]++;
-              if (515 < myMin[to]) myMin[to] = 515;
-              // Mã Hậu Pháo hoặc Trùng Pháo ngắm thẳng vào Tướng địch
+              if (525 < myMin[to]) myMin[to] = 525;
+              // Mã Hậu Pháo hoặc Trùng Pháo uy hiếp Tướng
               if (q === enemyK && SIDE_TAB[screenP] === side && (UPPER_TAB[screenP] === 78 || screenP === p)) {
-                v += 24;
-                if (side) rMatingBonus++; else bMatingBonus++;
+                v += 35;
+                if (side) rMatingBonus += 2; else bMatingBonus += 2;
               }
             }
-            if (q === p) v += 26;
+            if (q === p) v += 32;
             break;
           } else if (!isAbsPinned) {
             myAtt[to]++;
-            if (515 < myMin[to]) myMin[to] = 515;
+            if (525 < myMin[to]) myMin[to] = 525;
           }
         }
       }
-      if (side && r === 0) { v += 24; rBottomC = true; }
-      else if (!side && r === 9) { v += 24; bBottomC = true; }
-      v += (14 - distToEK) * 3;
+      if (side && r === 0) { v += 30; rBottomC = true; }
+      else if (!side && r === 9) { v += 30; bBottomC = true; }
+      v += (14 - distToEK) * 4;
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
-    } else if (t === 82) { // Rook (1090)
+    } else if (t === 82) { // Xe (1100)
       v += pstRook[idx];
       if (side) {
         rMaj += 2; rAtk++;
@@ -1532,45 +1298,45 @@ function evaluateRaw() {
           to += step;
           if (!isAbsPinned) {
             myAtt[to]++;
-            if (1090 < myMin[to]) myMin[to] = 1090;
+            if (1100 < myMin[to]) myMin[to] = 1100;
           }
           mob++;
           if (board[to]) break;
         }
       }
-      v += mob * 4 + (14 - distToEK) * 3;
+      v += mob * 5 + (14 - distToEK) * 4;
       if (c === 3 || c === 5) {
-        v += 22;
-        if (c === ekc) v += 28;
+        v += 26;
+        if (c === ekc) v += 32;
       }
-      if (side ? (r === 0 || r === 1) : (r === 9 || r === 8)) v += 26;
+      if (side ? (r === 0 || r === 1) : (r === 9 || r === 8)) v += 32;
       if (phase >= 12) {
-        if (!side && r === 0 && (c === 0 || c === 8)) v -= 28;
-        else if (side && r === 9 && (c === 0 || c === 8)) v -= 28;
+        if (!side && r === 0 && (c === 0 || c === 8)) v -= 30;
+        else if (side && r === 9 && (c === 0 || c === 8)) v -= 30;
       }
       if (distToEK <= 4) { if (side) rNear++; else bNear++; }
-    } else if (t === 65) { // Advisor (155)
+    } else if (t === 65) { // Sĩ (160)
       if (side) rAdv++; else bAdv++;
-      if (c === 4) v += 22;
+      if (c === 4) v += 25;
       if (!isAbsPinned) {
         const advTab = ADV_TO[side], b4 = i * 4;
         for (let k = 0; k < 4; k++) {
           const to = advTab[b4 + k];
-          if (to >= 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+          if (to >= 0) { myAtt[to]++; if (160 < myMin[to]) myMin[to] = 160; }
         }
       }
-    } else if (t === 66) { // Bishop (155)
+    } else if (t === 66) { // Tượng (160)
       if (side) rBish++; else bBish++;
-      if (c === 4) v += 24;
+      if (c === 4) v += 28;
       if (!isAbsPinned) {
         const bisTab = BIS_TO[side], eyeTab = BIS_EYE[side], b4 = i * 4;
         for (let k = 0; k < 4; k++) {
           const to = bisTab[b4 + k];
-          if (to >= 0 && board[eyeTab[b4 + k]] === 0) { myAtt[to]++; if (155 < myMin[to]) myMin[to] = 155; }
+          if (to >= 0 && board[eyeTab[b4 + k]] === 0) { myAtt[to]++; if (160 < myMin[to]) myMin[to] = 160; }
         }
       }
-    } else if (t === 75) { // King
-      if (c === 4 && (r === 0 || r === 9)) v += 15;
+    } else if (t === 75) { // Tướng
+      if (c === 4 && (r === 0 || r === 9)) v += 18;
       const kngTab = KNG_TO[side], b4 = i * 4;
       for (let k = 0; k < 4; k++) {
         const to = kngTab[b4 + k];
@@ -1580,26 +1346,26 @@ function evaluateRaw() {
     score += side ? v : -v;
   }
 
-  // VÒNG 2: THẾ TRẬN BÌNH PHONG MÃ & KHIÊN TRUNG LỘ CHỐNG PHÁO ĐẦU
+  // VÒNG 2: PHÂN TÍCH HỆ THỐNG PHÒNG THỦ & LIÊN KẾT
   const bLeftScreenN = board[20] === 110;
   const bRightScreenN = board[24] === 110;
-  if (bLeftScreenN && bRightScreenN) score -= (rHasCentralC ? 54 : 32);
+  if (bLeftScreenN && bRightScreenN) score -= (rHasCentralC ? 60 : 36);
   if (rHasCentralC) {
-    if (bAtt[31] >= 2) score -= 24;
-    if (board[22] === 98) score -= 24;
-    if (board[13] === 97) score -= 20;
+    if (bAtt[31] >= 2) score -= 28;
+    if (board[22] === 98) score -= 28;
+    if (board[13] === 97) score -= 22;
   }
 
   const rLeftScreenN = board[65] === 78;
   const rRightScreenN = board[69] === 78;
-  if (rLeftScreenN && rRightScreenN) score += (bHasCentralC ? 54 : 32);
+  if (rLeftScreenN && rRightScreenN) score += (bHasCentralC ? 60 : 36);
   if (bHasCentralC) {
-    if (rAtt[58] >= 2) score += 24;
-    if (board[67] === 66) score += 24;
-    if (board[76] === 65) score += 20;
+    if (rAtt[58] >= 2) score += 28;
+    if (board[67] === 66) score += 28;
+    if (board[76] === 65) score += 22;
   }
 
-  // VÒNG 3: PHÂN TÍCH ĐỔI QUÂN LỖ, QUÂN TREO & BẢO VỆ LẪN NHAU
+  // VÒNG 3: BẢO VỆ QUÂN VÀ TRỪNG PHẠT QUÂN TREO (TRÁNH ĐỔI QUÂN LỖ)
   let rHangingMajors = 0, bHangingMajors = 0;
   let rMaxThreat = 0, bMaxThreat = 0;
 
@@ -1616,58 +1382,58 @@ function evaluateRaw() {
     const minEnemyAtt = side ? bMinAtt[i] : rMinAtt[i];
     let syn = 0;
 
-    if (IS_MAJOR[p]) { // Xe (1090), Pháo (515), Mã (495)
+    if (IS_MAJOR[p]) {
       if (def > 0) {
-        syn += 14 + Math.min(def, 3) * 6;
+        syn += 16 + Math.min(def, 3) * 7;
       }
       if (att > 0) {
         if (def === 0) {
-          const hangPen = (t === 82 ? 195 : 120);
+          const hangPen = (t === 82 ? 220 : 135);
           syn -= hangPen;
           if (side) { rHangingMajors++; if (hangPen > rMaxThreat) rMaxThreat = hangPen; }
           else { bHangingMajors++; if (hangPen > bMaxThreat) bMaxThreat = hangPen; }
-        } else if (minEnemyAtt + 80 < myVal) {
+        } else if (minEnemyAtt + 75 < myVal) {
           const tradeLoss = (myVal - minEnemyAtt) >> 3;
-          const pen = 38 + tradeLoss;
+          const pen = 44 + tradeLoss;
           syn -= pen;
           if (side) { rHangingMajors++; if (pen > rMaxThreat) rMaxThreat = pen; }
           else { bHangingMajors++; if (pen > bMaxThreat) bMaxThreat = pen; }
         } else if (att > def) {
-          syn -= 46;
+          syn -= 50;
         }
       }
-    } else { // Tốt, Sĩ, Tượng
+    } else {
       if (def > 0) {
-        syn += (t === 65 || t === 66) ? 16 : 10;
+        syn += (t === 65 || t === 66) ? 18 : 12;
       } else if (att > 0) {
-        syn -= 22;
+        syn -= 26;
       }
     }
 
     score += side ? syn : -syn;
   }
 
-  if (rHangingMajors >= 2) score -= 175;
-  if (bHangingMajors >= 2) score += 175;
+  if (rHangingMajors >= 2) score -= 190;
+  if (bHangingMajors >= 2) score += 190;
 
-  if (rRooks === 2 && (rRookCols[0] === rRookCols[1] || rRookRows[0] === rRookRows[1])) score += 36;
-  if (bRooks === 2 && (bRookCols[0] === bRookCols[1] || bRookRows[0] === bRookRows[1])) score -= 36;
+  if (rRooks === 2 && (rRookCols[0] === rRookCols[1] || rRookRows[0] === rRookRows[1])) score += 42;
+  if (bRooks === 2 && (bRookCols[0] === bRookCols[1] || bRookRows[0] === bRookRows[1])) score -= 42;
 
-  if (rAdv === 2) score += 44; else if (rAdv === 0 && bMaj >= 2) score -= 110;
-  if (bAdv === 2) score -= 44; else if (bAdv === 0 && rMaj >= 2) score += 110;
-  if (rBish === 2) score += 34; else if (rBish === 0 && bMaj >= 2) score -= 65;
-  if (bBish === 2) score -= 34; else if (bBish === 0 && rMaj >= 2) score += 65;
+  if (rAdv === 2) score += 48; else if (rAdv === 0 && bMaj >= 2) score -= 120;
+  if (bAdv === 2) score -= 48; else if (bAdv === 0 && rMaj >= 2) score += 120;
+  if (rBish === 2) score += 38; else if (rBish === 0 && bMaj >= 2) score -= 75;
+  if (bBish === 2) score -= 38; else if (bBish === 0 && rMaj >= 2) score += 75;
 
   // ==========================================================================
-  // VÒNG 4: ĐÁNH GIÁ CÔNG SÁT ĐẠI KIỆN TƯỚNG (PHI TUYẾN TÍNH & SÁT THỨC)
+  // VÒNG 4: NGHỆ THUẬT SÁT PHÁP KINH HOÀNG (CÔNG SÁT ĐẠI TRUY SÁT)
   // ==========================================================================
   let rAtkWeight = rNear * 2 + rMatingBonus;
   let bAtkWeight = bNear * 2 + bMatingBonus;
 
-  if (rHasCentralC && rBottomC) { score += 28; rAtkWeight += 1; }
-  if (bHasCentralC && bBottomC) { score -= 28; bAtkWeight += 1; }
+  if (rHasCentralC && rBottomC) { score += 38; rAtkWeight += 2; } // Thiên Địa Pháo Đỏ
+  if (bHasCentralC && bBottomC) { score -= 38; bAtkWeight += 2; } // Thiên Địa Pháo Đen
 
-  // 1. Kiểm tra Xe kẹp lộ sườn (Lộ 4, 6) & Xe/Pháo trầm đáy (Thiên Địa Pháo)
+  // 1. Pháo Đầu Kết Hợp Xe Trầm Đáy & Thiết Môn Thuyên
   let rRibRooks = 0, bRibRooks = 0;
   let rBottomRooks = 0, bBottomRooks = 0;
   for (let k = 0; k < rRooks; k++) {
@@ -1678,12 +1444,12 @@ function evaluateRaw() {
     if (bRookCols[k] === 3 || bRookCols[k] === 5 || bRookCols[k] === rkc) { bRibRooks++; bAtkWeight += 2; }
     if (bRookRows[k] >= 7) { bBottomRooks++; bAtkWeight += 2; }
   }
-  if (rRibRooks >= 2) score += 55;
-  if (bRibRooks >= 2) score -= 55;
-  if (rBottomRooks >= 2) score += 60;
-  if (bBottomRooks >= 2) score -= 60;
+  if (rRibRooks >= 2) score += 65;
+  if (bRibRooks >= 2) score -= 65;
+  if (rBottomRooks >= 2) score += 75;
+  if (bBottomRooks >= 2) score -= 75;
 
-  // 2. Áp lực Pháo đầu, Thiết Môn Thuyên & Thiên Địa Pháo
+  // 2. Chiếu Ép Trung Lộ (Pháo Trống & Pháo Đầu Uy Hiếp Khốc Liệt)
   for (let s = 0; s < 2; s++) {
     const ek = kingSq[s ^ 1];
     if (ek >= 0 && (ek % 9) === 4) {
@@ -1696,15 +1462,12 @@ function evaluateRaw() {
         if (p) {
           if (p === myC) {
             if (screens === 0) {
-              score += (s ? 85 : -85); // Pháo trống chiếu trực tiếp
-              if (s) rAtkWeight += 3; else bAtkWeight += 3;
+              score += (s ? 100 : -100); // Pháo Trống
+              if (s) rAtkWeight += 4; else bAtkWeight += 4;
             } else if (screens === 1) {
-              const ironBolt = (s ? rRibRooks : bRibRooks) > 0 ? 35 : 0;
-              score += s ? (48 + ironBolt) : -(48 + ironBolt);
+              const ironBolt = (s ? rRibRooks : bRibRooks) > 0 ? 45 : 0;
+              score += s ? (56 + ironBolt) : -(56 + ironBolt);
               if (s) rAtkWeight += 3; else bAtkWeight += 3;
-            } else if (screens === 2) {
-              score += (s ? 24 : -24);
-              if (s) rAtkWeight += 1; else bAtkWeight += 1;
             }
             break;
           }
@@ -1716,17 +1479,17 @@ function evaluateRaw() {
     }
   }
 
-  // 3. Hỏa lực dồn vào Tâm Cửu Cung (ô [1,4] = 13 của Đen, ô [8,4] = 76 của Đỏ)
+  // 3. Khóa Chặt Cung Tướng (Palace Lockdown)
   if (rAtt[13] >= 2) {
     rAtkWeight += rAtt[13];
-    score += 28 * rAtt[13] + (bAdv < 2 ? 35 : 0);
+    score += 32 * rAtt[13] + (bAdv < 2 ? 42 : 0);
   }
   if (bAtt[76] >= 2) {
     bAtkWeight += bAtt[76];
-    score -= 28 * bAtt[76] + (rAdv < 2 ? 35 : 0);
+    score -= 32 * bAtt[76] + (rAdv < 2 ? 42 : 0);
   }
 
-  // 4. Đếm số ô thoát an toàn của Tướng (King Escape Restriction)
+  // 4. Siết Nghẹt Đường Thoát Của Tướng
   if (bk >= 0) {
     let bSafeEscapes = 0;
     const b4 = bk * 4, kTab = KNG_TO[0];
@@ -1739,8 +1502,8 @@ function evaluateRaw() {
       }
     }
     if (bSafeEscapes === 0 && rNear > 0) {
-      score += 55 + rNear * 18;
-      rAtkWeight += 2;
+      score += 65 + rNear * 22;
+      rAtkWeight += 3;
     }
   }
   if (rk >= 0) {
@@ -1755,41 +1518,41 @@ function evaluateRaw() {
       }
     }
     if (rSafeEscapes === 0 && bNear > 0) {
-      score -= 55 + bNear * 18;
-      bAtkWeight += 2;
+      score -= 65 + bNear * 22;
+      bAtkWeight += 3;
     }
   }
 
-  // 5. Điểm thưởng Công Sát Phi Tuyến Tính
+  // 5. Tính Điểm Công Sát Phi Tuyến Tính (King Danger Curve)
   const bDefWeakness = 5 - bAdv - (bBish >> 1);
   const rDefWeakness = 5 - rAdv - (rBish >> 1);
-  const rKingDanger = Math.min(420, (rAtkWeight * rAtkWeight * bDefWeakness) >> 1);
-  const bKingDanger = Math.min(420, (bAtkWeight * bAtkWeight * rDefWeakness) >> 1);
+  const rKingDanger = Math.min(500, (rAtkWeight * rAtkWeight * bDefWeakness) >> 1);
+  const bKingDanger = Math.min(500, (bAtkWeight * bAtkWeight * rDefWeakness) >> 1);
   score += rKingDanger - bKingDanger;
 
   if (score > 350) {
-    score += (6 - bMaj) * 18;
+    score += (6 - bMaj) * 20;
   } else if (score < -350) {
-    score -= (6 - rMaj) * 18;
+    score -= (6 - rMaj) * 20;
   }
 
   if (rMaj + bMaj <= 5) {
     if (score > 180) {
-      if (rkc === 4) score += 24;
-      if (rkc === bkc) score += 30;
-      score += (Math.abs(bkc - 4) + Math.abs(bkr - 0)) * 18;
+      if (rkc === 4) score += 28;
+      if (rkc === bkc) score += 35;
+      score += (Math.abs(bkc - 4) + Math.abs(bkr - 0)) * 20;
     } else if (score < -180) {
-      if (bkc === 4) score -= 24;
+      if (bkc === 4) score -= 28;
       if (bkc === rkc) score -= 30;
-      score -= (Math.abs(rkc - 4) + Math.abs(rkr - 9)) * 18;
+      score -= (Math.abs(rkc - 4) + Math.abs(rkr - 9)) * 20;
     }
   }
 
   if (score > 0 && rAtk === 0) score = rPot > 0 ? (score / 2) | 0 : (score / 4) | 0;
   else if (score < 0 && bAtk === 0) score = bPot > 0 ? (score / 2) | 0 : (score / 4) | 0;
 
-  evalRMaxThreat = rMaxThreat + (rHangingMajors >= 2 ? 140 : 0) + (bKingDanger >> 2);
-  evalBMaxThreat = bMaxThreat + (bHangingMajors >= 2 ? 140 : 0) + (rKingDanger >> 2);
+  evalRMaxThreat = rMaxThreat + (rHangingMajors >= 2 ? 150 : 0) + (bKingDanger >> 2);
+  evalBMaxThreat = bMaxThreat + (bHangingMajors >= 2 ? 150 : 0) + (rKingDanger >> 2);
   return score;
 }
 
@@ -1812,7 +1575,7 @@ function evalSide(side) {
   const myThreatOnEnemy = side ? evalBMaxThreat : evalRMaxThreat;
   const enemyThreatOnMe = side ? evalRMaxThreat : evalBMaxThreat;
   const tempoTactical = (myThreatOnEnemy >> 1) - (enemyThreatOnMe >> 2);
-  return (side ? s : -s) + 16 + tempoTactical;
+  return (side ? s : -s) + 18 + tempoTactical;
 }
 
 function doMove(from, to, cap, moving, side) {
@@ -1850,7 +1613,7 @@ function undoMove(from, to, cap, moving, side) {
 }
 
 // ============================================================================
-// STAGED MOVE ORDERING (Lazy Quiet Scoring + Zero Duplicate SEE)
+// STAGED MOVE ORDERING
 // ============================================================================
 function scoreQuietMovesRange(ply, startIdx, n, ttMoveCode, side) {
   const baseIdx = ply * MAX_MOVES;
@@ -1874,7 +1637,7 @@ function scoreQuietMovesRange(ply, startIdx, n, ttMoveCode, side) {
     if (mCode === ttMoveCode) {
       moveScore[idx] = 10000000;
     } else if (moveCap[idx]) {
-      // Giữ nguyên điểm SEE + Capture History đã chấm lúc sinh nước ăn quân
+      // Giữ nguyên điểm ăn quân
     } else {
       let s = 0;
       if (f === t2 && t === f2) s -= 6000000;
@@ -1896,27 +1659,24 @@ function scoreQuietMovesRange(ply, startIdx, n, ttMoveCode, side) {
           const oldDist = Math.abs(ROW[f] - ekr) + Math.abs(COL[f] - ekc);
           const newDist = Math.abs(tr - ekr) + Math.abs(tc - ekc);
           if (newDist < oldDist && newDist <= 4) {
-            s += (5 - newDist) * 1200;
+            s += (5 - newDist) * 1400;
           }
           if (ut === 82 && (tc === 3 || tc === 5 || tc === ekc || tr === ekr)) {
-            s += 2500;
+            s += 3000;
           } else if (ut === 67 && (tc === ekc || tr === ekr)) {
-            s += 2800;
+            s += 3200;
           }
         }
-        // Phạt nặng các nước tĩnh đưa Xe/Pháo/Mã vào ô bị quân nhỏ hơn bắt mà SEE âm
         if (IS_MAJOR[moving]) {
           if (isAttackedBySmallerPiece(t, side ^ 1, mVal)) {
             const quietSee = see(f, t, side);
             if (quietSee < -100) {
-              // Đánh dấu < -200000 để search() nhận diện SEE Quiet Pruning tức thì mà không cần gọi lại see()!
-              s -= 260000 + ((-quietSee) << 6);
+              s -= 280000 + ((-quietSee) << 6);
             } else if (quietSee < -50) {
-              s -= 140000 + ((-quietSee) << 5);
+              s -= 150000 + ((-quietSee) << 5);
             }
           } else if (isAttackedBySmallerPiece(f, side ^ 1, mVal) && see(f, t, side) >= 0) {
-            // Quân chủ lực đang bị quân nhỏ rình bắt ở f, ưu tiên chạy sang ô t an toàn (see >= 0)
-            s += 18000;
+            s += 22000; // Thoát quân an toàn
           }
         }
         if (ut === 78) {
@@ -1975,7 +1735,7 @@ function capHistUpdate(idx, bonus) {
 }
 
 // ============================================================================
-// REPETITION
+// REPETITION DETECTION
 // ============================================================================
 function setRepRoot() {
   if (repBaseLen > 0 && repHashLo[repBaseLen - 1] === curHashLo && repHashHi[repBaseLen - 1] === curHashHi) {
@@ -2008,7 +1768,7 @@ function shouldStop() {
 }
 
 // ============================================================================
-// QUIESCENCE SEARCH (Zero-Overhead Capture Scoring)
+// QUIESCENCE SEARCH (Được nâng cấp kiểm tra nước chiếu sâu)
 // ============================================================================
 function qsearch(alpha, beta, side, ply, qPly) {
   if ((++nodes & 2047) === 0 && shouldStop()) { stopped = 1; return 0; }
@@ -2020,14 +1780,14 @@ function qsearch(alpha, beta, side, ply, qPly) {
     stand = evalSide(side);
     if (stand >= beta) return beta;
     if (stand > alpha) alpha = stand;
-    if (qPly >= 12) return stand;
+    if (qPly >= 14) return stand;
   }
 
-  const includeChecks = !check && (qPly <= 1);
+  // qPly <= 2 cho phép tìm kiếm thêm nước chiếu hiểm hóc để tránh sót sát cục
+  const includeChecks = !check && (qPly <= 2);
   const n = generateLegalMoves(side, !check, ply, includeChecks, check ? 1 : 0);
   if (n === 0) return check ? (-MATE + ply) : alpha;
 
-  // Chỉ gọi scoreMoves nếu có sinh nước đi tĩnh (khi bị chiếu hoặc qPly <= 1)
   if (check || includeChecks) {
     scoreMoves(ply, n, -1, side);
   }
@@ -2036,9 +1796,9 @@ function qsearch(alpha, beta, side, ply, qPly) {
     const idx = pickMove(ply, n, i);
     const f = moveFrom[idx], t = moveTo[idx], cap = moveCap[idx];
     if (!check && cap !== 0) {
-      if (stand + baseVal(cap) + 220 < alpha) continue;     // Delta pruning
-      if (moveScore[idx] < 250000) continue;                // Cắt ngay lập tức nước dùng quân to đổi quân nhỏ ở mọi tầng qPly
-      if (moveScore[idx] < 1500000 && qPly > 0) continue;   // Cắt các nước thí quân lỗ nhẹ từ qPly >= 1
+      if (stand + baseVal(cap) + 240 < alpha) continue;
+      if (moveScore[idx] < 250000) continue;
+      if (moveScore[idx] < 1500000 && qPly > 0) continue;
     }
 
     const moving = board[f];
@@ -2054,7 +1814,7 @@ function qsearch(alpha, beta, side, ply, qPly) {
 }
 
 // ============================================================================
-// MAIN SEARCH (Staged Lazy Quiet Scoring + Fast Pruning)
+// MAIN SEARCH
 // ============================================================================
 function search(depth, alpha, beta, side, ply, allowNull) {
   if ((++nodes & 2047) === 0 && shouldStop()) { stopped = 1; return 0; }
@@ -2092,7 +1852,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
   }
 
   const check = inCheck(side) === 1;
-  if (check && ply < Math.min(MAX_PLY - 12, curIter * 2 + 8)) depth++;
+  if (check && ply < Math.min(MAX_PLY - 12, curIter * 2 + 10)) depth++;
   if (depth <= 0) return qsearch(alpha, beta, side, ply, 0);
 
   let staticEval = NO_EVAL;
@@ -2105,19 +1865,19 @@ function search(depth, alpha, beta, side, ply, allowNull) {
 
   if (!pvNode && !check) {
     // Razoring
-    if (depth <= 2 && staticEval + 260 + 190 * (depth - 1) <= alpha) {
+    if (depth <= 2 && staticEval + 280 + 200 * (depth - 1) <= alpha) {
       const v = qsearch(alpha, beta, side, ply, 0);
       if (stopped) return 0;
       if (v <= alpha) return v;
     }
-    // Reverse Futility Pruning (Static Null Move)
+    // Static Null Move / Reverse Futility Pruning
     if (depth <= 6 && beta < MATE - 1000) {
-      const margin = 110 * depth - (improving ? 35 : 0);
+      const margin = 115 * depth - (improving ? 40 : 0);
       if (staticEval - margin >= beta) return staticEval - margin;
     }
     // Null Move Pruning
     if (allowNull && depth >= 3 && staticEval >= beta && majorCnt[side] > 0) {
-      let R = 2 + (depth >= 6 ? 1 : 0) + (depth >= 11 ? 1 : 0) + (staticEval - beta > 240 ? 1 : 0);
+      let R = 2 + (depth >= 6 ? 1 : 0) + (depth >= 11 ? 1 : 0) + (staticEval - beta > 250 ? 1 : 0);
       if (R > depth - 1) R = depth - 1;
       repHashLo[repRoot + ply] = curHashLo;
       repHashHi[repRoot + ply] = curHashHi;
@@ -2141,7 +1901,6 @@ function search(depth, alpha, beta, side, ply, allowNull) {
     }
   }
 
-  // Internal Iterative Reduction
   if (ttMoveCode < 0 && depth >= 5 && !check) depth--;
 
   const origAlpha = alpha;
@@ -2149,9 +1908,8 @@ function search(depth, alpha, beta, side, ply, allowNull) {
   if (n === 0) return -MATE + ply;
 
   const singleReplyExt = (check && n === 1 && ply < MAX_PLY - 10) ? 1 : 0;
-
   const baseIdx = ply * MAX_MOVES;
-  // Giai đoạn 1: Đánh dấu ttMoveCode (10000000) trước mà chưa chấm điểm các nước đi tĩnh
+
   if (ttMoveCode >= 0) {
     for (let i = 0; i < n; i++) {
       const idx = baseIdx + i;
@@ -2167,8 +1925,8 @@ function search(depth, alpha, beta, side, ply, allowNull) {
   let bestCode = moveFrom[baseIdx] * 90 + moveTo[baseIdx];
   let quietSeen = 0, quietN = 0;
   const hBase = side * 8100;
-  const lmpLimit = (improving ? 9 : 6) + depth * depth * 2;
-  const futMargin = 130 + 110 * depth;
+  const lmpLimit = (improving ? 10 : 7) + depth * depth * 2;
+  const futMargin = 140 + 115 * depth;
   const lmrBase = (depth < 64 ? depth : 63) * MAX_MOVES;
 
   const pp = ply > 0 ? searchHistoryPiece[ply - 1] : 0;
@@ -2177,7 +1935,6 @@ function search(depth, alpha, beta, side, ply, allowNull) {
 
   for (let i = 0; i < n; i++) {
     let idx = pickMove(ply, n, i);
-    // Giai đoạn 2: Khi đã hết ttMove và các nước ăn quân lời (>= 1900000), mới chấm điểm các nước đi tĩnh còn lại!
     if (!quietsScored && moveScore[idx] < 1900000) {
       scoreQuietMovesRange(ply, i, n, ttMoveCode, side);
       quietsScored = true;
@@ -2189,7 +1946,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
     const moving = board[f];
     const isQuiet = cap === 0;
     const goodCap = !isQuiet && moveScore[idx] >= 2000000;
-    const blunderCap = !isQuiet && moveScore[idx] < 250000; // seeVal < -120 (Lấy quân to đổi quân nhỏ)
+    const blunderCap = !isQuiet && moveScore[idx] < 250000;
     const isPalaceCenterSac = !isQuiet && (t === 13 || t === 76) && UPPER_TAB[cap] === 65;
 
     let prune = false;
@@ -2198,7 +1955,6 @@ function search(depth, alpha, beta, side, ply, allowNull) {
         if (depth <= 4 && (quietSeen >= lmpLimit || (staticEval + futMargin <= alpha && quietSeen >= 2))) {
           prune = true;
         } else if (depth <= 4 && moveScore[idx] < -200000) {
-          // SEE Quiet Pruning (đã được tính trong scoreQuietMovesRange, không cần gọi lại see!)
           prune = true;
         }
       } else if (blunderCap && depth <= (isPalaceCenterSac ? 3 : 6)) {
@@ -2268,7 +2024,7 @@ function search(depth, alpha, beta, side, ply, allowNull) {
     }
     if (sc > alpha) alpha = sc;
     if (alpha >= beta) {
-      const bonus = Math.min(depth * depth * 8, 1600);
+      const bonus = Math.min(depth * depth * 8, 1700);
       if (isQuiet) {
         if (killers0[ply] !== mCode) {
           killers1[ply] = killers0[ply];
@@ -2411,7 +2167,7 @@ function searchBestMove(maxDepth, maxNodes, side, timeMs) {
   nodeLimit = maxNodes > 2000 ? maxNodes : 2000;
   const t0 = performance.now();
   deadline = timeMs > 0 ? t0 + timeMs : 0;
-  const softLimit = timeMs > 0 ? timeMs * 0.5 : 0;
+  const softLimit = timeMs > 0 ? timeMs * 0.52 : 0;
   stopped = 0;
   lastScore = 0;
   completedDepth = 0;
@@ -2490,7 +2246,7 @@ function searchBestMove(maxDepth, maxNodes, side, timeMs) {
     const unstable = instability > 0;
     instability = 0;
     if (d >= 8) {
-      if (nodes >= nodeLimit * (unstable ? 0.75 : 0.5)) break;
+      if (nodes >= nodeLimit * (unstable ? 0.78 : 0.55)) break;
       if (softLimit && (performance.now() - t0) >= softLimit * (unstable ? 1.5 : 1)) break;
     }
   }
@@ -2552,8 +2308,8 @@ async function loadExternalEngine() {
 // ============================================================================
 // MULTI-BRANCH PONDERING
 // ============================================================================
-const PONDER_MAX_DEPTH = 18;
-const PONDER_CACHE_MAX = 600;
+const PONDER_MAX_DEPTH = 20;
+const PONDER_CACHE_MAX = 800;
 let ponderActive = false;
 let ponderTimer = null;
 const ponderBranchCache = new Map();
@@ -2753,15 +2509,15 @@ function startPonderingSession(bState, opponentSideBool, aiSideBool, positionHis
 }
 
 // ============================================================================
-// MESSAGE HANDLER
+// PRESETS & MESSAGE HANDLER (Nâng cấp sức mạnh tìm kiếm)
 // ============================================================================
 const PRESETS = {
-  1: { depth: 8,  nodes: 200000,  time: 300,  instantDepth: 6 },
-  2: { depth: 10, nodes: 500000,  time: 500,  instantDepth: 7 },
-  3: { depth: 12, nodes: 1000000, time: 800,  instantDepth: 8 },
-  4: { depth: 14, nodes: 2000000, time: 1300, instantDepth: 9 },
-  5: { depth: 17, nodes: 3500000, time: 2000, instantDepth: 10 },
-  6: { depth: 22, nodes: 6000000, time: 3000, instantDepth: 11 }
+  1: { depth: 9,  nodes: 250000,  time: 350,  instantDepth: 6 },
+  2: { depth: 11, nodes: 600000,  time: 600,  instantDepth: 7 },
+  3: { depth: 14, nodes: 1400000, time: 1000, instantDepth: 8 },
+  4: { depth: 16, nodes: 2600000, time: 1600, instantDepth: 9 },
+  5: { depth: 19, nodes: 4500000, time: 2400, instantDepth: 10 },
+  6: { depth: 24, nodes: 8000000, time: 3800, instantDepth: 12 }
 };
 
 self.onmessage = async ({ data = {} }) => {
@@ -2806,7 +2562,7 @@ self.onmessage = async ({ data = {} }) => {
         self.postMessage({
           result: {
             move: bookMove,
-            score: 20,
+            score: 25,
             nodes: 1,
             depth: 'Book',
             pv: [bookMove],
@@ -2881,7 +2637,7 @@ self.onmessage = async ({ data = {} }) => {
       totalNodes = ext.get_nodes();
       depth = ext.get_completed_depth();
       score = ext.get_last_score();
-      const count = Math.min(ext.get_pv_length(), 12);
+      const count = Math.min(ext.get_pv_length(), 14);
       for (let i = 0; i < count; i++) {
         const m = ext.get_pv_move(i);
         if (m >= 0) pv.push(decodeMove(m));
@@ -2892,7 +2648,7 @@ self.onmessage = async ({ data = {} }) => {
       totalNodes = nodes;
       depth = completedDepth;
       score = lastScore;
-      const count = Math.min(pvLen[0], 12);
+      const count = Math.min(pvLen[0], 14);
       for (let i = 0; i < count; i++) {
         if (pvTable[i] >= 0) pv.push(decodeMove(pvTable[i]));
       }
