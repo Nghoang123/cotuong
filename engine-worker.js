@@ -12,7 +12,7 @@
  *  4. CALIBRATED XIANGQI MATING PATTERNS: Unblocked Ngọa Tào Mã, Mã Hậu Pháo, Trùng Pháo, and Thiên Địa Pháo.
  */
 
-const USE_EXTERNAL_WASM = false;
+const USE_EXTERNAL_WASM = true;
 
 // ============================================================================
 // SÁCH KHAI CUỘC ĐẠI KIỆN TƯỚNG (CHUẨN XÁC CHO CẢ ĐỎ VÀ ĐEN + TỰ ĐỘNG ĐỐI XỨNG)
